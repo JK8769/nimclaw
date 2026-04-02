@@ -1,134 +1,578 @@
-import std/[asyncdispatch, httpclient, json, strutils, tables, locks, times]
+import std/[asyncdispatch, json, strutils, tables, os, osproc, strtabs, streams, times, locks, typedthreads, options, unicode]
+import unicodedb/[widths, properties]
 import base
-import ../bus, ../bus_types, ../config, ../logger, ../utils
-import ws
+import ../bus, ../bus_types, ../config, ../logger
 
 type
-  FeishuChannel* = ref object of BaseChannel
+  FeishuTypingState = object
+    reactionID: string
+    appID: string
+
+  FeishuAppInstance = ref object
     appID: string
     appSecret: string
-    token: string
-    ws: WebSocket
+    enabled: bool
+    subscribeProcess: Process
+    subscriberThread: Thread[(Process, FeishuChannel, string)]
+
+  FeishuChannel* = ref object of BaseChannel
+    apps: seq[FeishuAppInstance]
+    typing: Table[string, FeishuTypingState]
+    messageCache*: Table[string, float] # message_id -> timestamp
+    cacheLock*: Lock
+    larkCliBin: string  # path to lark-cli binary
+
+# --- Markdown table → Feishu post formatting utilities ---
+
+proc splitTableRow(row: string): seq[string] =
+  var s = row.strip()
+  if s.startsWith("|"): s = s[1 .. ^1]
+  if s.endsWith("|"): s = s[0 .. ^2]
+  for part in s.split("|"):
+    result.add(part.strip())
+
+proc isTableSeparatorRow(row: string): bool =
+  let cells = splitTableRow(row)
+  if cells.len == 0: return false
+  for c in cells:
+    if c.len == 0: return false
+    for ch in c:
+      if ch notin {'-', ':', ' '}:
+        return false
+  true
+
+proc displayWidth(s: string): int =
+  for r in s.runes:
+    if combining(r) != 0:
+      continue
+    case unicodeWidth(r)
+    of uwdtWide, uwdtFull: result += 2
+    else: result += 1
+
+proc buildPostContent(text: string): string =
+  var rows: seq[JsonNode] = @[]
+  let lines = text.split("\n")
+
+  # Table detection and rendering
+  var i = 0
+  while i < lines.len:
+    let line = lines[i]
+    # Detect table: look for separator row
+    if i + 1 < lines.len and line.contains("|") and isTableSeparatorRow(lines[i+1]):
+      let headerCells = splitTableRow(line)
+      let numCols = headerCells.len
+      var colWidths = newSeq[int](numCols)
+      for ci, c in headerCells:
+        colWidths[ci] = max(colWidths[ci], displayWidth(c))
+
+      var dataRows: seq[seq[string]] = @[]
+      var j = i + 2
+      while j < lines.len and lines[j].contains("|"):
+        let cells = splitTableRow(lines[j])
+        if cells.len == 0: break
+        var row: seq[string] = @[]
+        for ci in 0..<numCols:
+          let cell = if ci < cells.len: cells[ci] else: ""
+          row.add(cell)
+          colWidths[ci] = max(colWidths[ci], displayWidth(cell))
+        dataRows.add(row)
+        inc j
+
+      proc padCell(s: string, w: int): string =
+        let extra = w - displayWidth(s)
+        s & ' '.repeat(max(0, extra))
+
+      var tableText = ""
+      var headerLine = ""
+      for ci, c in headerCells:
+        if ci > 0: headerLine.add("  ")
+        headerLine.add(padCell(c, colWidths[ci]))
+      tableText.add(headerLine)
+
+      for dr in dataRows:
+        tableText.add("\n")
+        var dataLine = ""
+        for ci, c in dr:
+          if ci > 0: dataLine.add("  ")
+          dataLine.add(padCell(c, colWidths[ci]))
+        tableText.add(dataLine)
+
+      rows.add(%*[{"tag": "text", "text": tableText & "\n"}])
+      i = j
+      continue
+
+    rows.add(%*[{"tag": "text", "text": line & "\n"}])
+    inc i
+
+  result = $ %*{"zh_cn": {"content": rows}}
+
+proc tryExtractInteractiveCard(content: string): Option[string] =
+  try:
+    let j = parseJson(content)
+    if j.kind != JObject: return options.none(string)
+
+    if j.hasKey("nimclaw_feishu") and j["nimclaw_feishu"].kind == JObject:
+      let nf = j["nimclaw_feishu"]
+      if nf.getOrDefault("msg_type").getStr() != "interactive":
+        return options.none(string)
+      let card = nf.getOrDefault("card")
+      if card.kind != JObject:
+        return options.none(string)
+      return options.some($card)
+
+    if j.getOrDefault("msg_type").getStr() == "interactive":
+      let card = j.getOrDefault("card")
+      if card.kind == JObject:
+        return options.some($card)
+      return options.none(string)
+
+    options.none(string)
+  except:
+    options.none(string)
+
+proc tryExtractAuthFallback(text: string): Option[(string, string, int)] =
+  let s = text.strip()
+  if s.len == 0 or not s.startsWith("{"): return options.none((string, string, int))
+  try:
+    let j = parseJson(s)
+    if j.kind != JObject: return options.none((string, string, int))
+    let url = j.getOrDefault("verification_uri_complete").getStr(j.getOrDefault("verification_uri").getStr(""))
+    let code = j.getOrDefault("user_code").getStr("")
+    let expiresIn = j.getOrDefault("expires_in").getInt(0)
+    if url.len == 0 and code.len == 0: return options.none((string, string, int))
+    options.some((url, code, expiresIn))
+  except:
+    options.none((string, string, int))
+
+proc collectJsonStrings(node: JsonNode; acc: var seq[string]) =
+  if node.isNil: return
+  case node.kind
+  of JString: acc.add(node.getStr())
+  of JObject:
+    for _, v in node.getFields(): collectJsonStrings(v, acc)
+  of JArray:
+    for v in node.getElems(): collectJsonStrings(v, acc)
+  else: discard
+
+proc findAuthUrlInCard(node: JsonNode): string =
+  if node.isNil: return ""
+  if node.kind == JObject:
+    if node.hasKey("multi_url") and node["multi_url"].kind == JObject:
+      let mu = node["multi_url"]
+      let u = mu.getOrDefault("url").getStr(mu.getOrDefault("pc_url").getStr(""))
+      if u.len > 0: return u
+    if node.hasKey("url") and node["url"].kind == JString:
+      let u = node["url"].getStr()
+      if u.startsWith("http"): return u
+    for _, v in node.getFields():
+      let u = findAuthUrlInCard(v)
+      if u.len > 0: return u
+    return ""
+  if node.kind == JArray:
+    for v in node.getElems():
+      let u = findAuthUrlInCard(v)
+      if u.len > 0: return u
+    return ""
+  ""
+
+proc tryExtractUserCodeFromText(s: string): string =
+  let k = "验证码"
+  let pos = s.find(k)
+  if pos < 0: return ""
+  var i = pos + k.len
+  while i < s.len:
+    if s[i] in {':', ' ', '\t'}:
+      inc i
+      continue
+    if i + 2 < s.len and s[i].ord == 0xEF and s[i + 1].ord == 0xBC and s[i + 2].ord == 0x9A:
+      i += 3
+      continue
+    break
+  if i + 1 < s.len and s[i] == '*' and s[i + 1] == '*':
+    i += 2
+    let j = s.find("**", i)
+    if j > i: return s[i ..< j].strip()
+    return ""
+  var j = i
+  while j < s.len and s[j] notin {' ', '\t', '\n', '\r'}: inc j
+  if j > i: return s[i ..< j].strip()
+  ""
+
+proc tryExtractAuthFallbackFromCard(cardJson: string): Option[(string, string, int)] =
+  let s = cardJson.strip()
+  if s.len == 0 or not s.startsWith("{"): return options.none((string, string, int))
+  try:
+    let j = parseJson(s)
+    if j.kind != JObject: return options.none((string, string, int))
+    let url = findAuthUrlInCard(j)
+    var texts: seq[string] = @[]
+    collectJsonStrings(j, texts)
+    var code = ""
+    for t in texts:
+      code = tryExtractUserCodeFromText(t)
+      if code.len > 0: break
+    if code.len == 0: return options.none((string, string, int))
+    options.some((url, code, 0))
+  except:
+    options.none((string, string, int))
+
+# --- Message cache persistence ---
+
+proc getCachePath(c: FeishuChannel): string =
+  getNimClawDir() / "channels" / "feishu" / "cache.json"
+
+proc saveCache(c: FeishuChannel) =
+  let path = c.getCachePath()
+  try:
+    createDir(parentDir(path))
+    let j = %c.messageCache
+    writeFile(path, $j)
+  except: discard
+
+proc loadCache(c: FeishuChannel) =
+  let path = c.getCachePath()
+  if fileExists(path):
+    try:
+      let j = parseFile(path)
+      acquire(c.cacheLock)
+      for k, v in j.getFields:
+        c.messageCache[k] = v.getFloat()
+      release(c.cacheLock)
+      infoCF("feishu", "Loaded persistent message cache", {"entries": $c.messageCache.len}.toTable)
+    except: discard
+
+proc pruneCache(c: FeishuChannel) =
+  let now = epochTime()
+  const maxAge = 3600.0 * 24.0
+  var toDel: seq[string] = @[]
+  acquire(c.cacheLock)
+  for k, v in c.messageCache.pairs:
+    if now - v > maxAge: toDel.add k
+  for k in toDel: c.messageCache.del k
+  release(c.cacheLock)
+  if toDel.len > 0:
+    infoCF("feishu", "Pruned message cache", {"deleted": $toDel.len}.toTable)
+    c.saveCache()
+
+# --- lark-cli bridge reader ---
+
+proc eventReader(args: (Process, FeishuChannel, string)) {.thread.} =
+  ## Reads compact NDJSON events from `lark-cli event +subscribe --compact --quiet`.
+  let (p, c, appID) = args
+  let s = p.outputStream()
+  var line = ""
+  while c.running and not s.atEnd():
+    try:
+      if not s.readLine(line): continue
+      if line.len == 0 or not line.startsWith("{"): continue
+
+      let evt = parseJson(line)
+      let evtType = evt.getOrDefault("type").getStr()
+
+      if evtType != "im.message.receive_v1":
+        debugCF("feishu", "Non-IM event received", {"type": evtType}.toTable)
+        continue
+
+      let messageID = evt.getOrDefault("message_id").getStr()
+      let chatID = evt.getOrDefault("chat_id").getStr()
+      let senderID = evt.getOrDefault("sender_id").getStr()
+      let messageType = evt.getOrDefault("message_type").getStr("text")
+      let content = evt.getOrDefault("content").getStr()
+      let createTimeStr = evt.getOrDefault("create_time").getStr()
+
+      # Dedup by message_id
+      if messageID.len > 0:
+        let isDuplicate = block:
+          acquire(c.cacheLock)
+          try:
+            if c.messageCache.hasKey(messageID):
+              true
+            else:
+              c.messageCache[messageID] = epochTime()
+              c.saveCache()
+              false
+          finally:
+            release(c.cacheLock)
+        if isDuplicate:
+          debugCF("feishu", "Discarding duplicate", {"msg_id": messageID}.toTable)
+          continue
+
+      # Ignore stale messages (>5 min old)
+      if createTimeStr.len > 0:
+        let createTime = createTimeStr.parseBiggestInt
+        let nowMs = (epochTime() * 1000).int64
+        if createTime > 0 and (nowMs - createTime) > 300_000:
+          debugCF("feishu", "Ignoring stale message", {"msg_id": messageID, "age_s": $((nowMs - createTime) div 1000)}.toTable)
+          continue
+
+      infoCF("feishu", "Processing message", {"msg_id": messageID, "sender": senderID, "chat": chatID, "type": messageType}.toTable)
+
+      var finalContent = content
+      if messageType != "text":
+        finalContent = "[Non-text message: " & messageType & "]"
+
+      var metadata = {"message_id": messageID, "app_id": appID}.toTable
+      let threadID = evt.getOrDefault("thread_id").getStr()
+      if threadID.len > 0:
+        metadata["thread_id"] = threadID
+
+      c.handleMessage(senderID, chatID, finalContent, @[], metadata)
+    except Exception as e:
+      errorCF("feishu", "Event parse error", {"error": e.msg}.toTable)
+  c.running = false
+
+# --- lark-cli binary discovery ---
+
+proc findLarkCli(): string =
+  # Check thirdparty build, then PATH
+  let thirdparty = currentSourcePath().parentDir().parentDir().parentDir().parentDir() / "thridparty" / "cli" / "lark-cli"
+  if fileExists(thirdparty): return thirdparty
+  let onPath = findExe("lark-cli")
+  if onPath.len > 0: return onPath
+  return ""
+
+proc initLarkCliConfig(bin, appID, appSecret: string) =
+  ## Initialize lark-cli config non-interactively for an app.
+  let configDir = getNimClawDir() / "channels" / "feishu" / "lark-cli-" & appID
+  try:
+    createDir(configDir)
+  except: discard
+  let env = newStringTable(modeCaseSensitive)
+  env["LARK_CLI_CONFIG_DIR"] = configDir
+  try:
+    let p = startProcess(bin, args = ["config", "init", "--app-id", appID, "--app-secret-stdin", "--brand", "feishu"],
+                         env = env, options = {poUsePath})
+    p.inputStream.writeLine(appSecret)
+    p.inputStream.close()
+    let code = p.waitForExit(10000)
+    p.close()
+    if code == 0:
+      infoCF("feishu", "lark-cli config initialized", {"app_id": appID}.toTable)
+    else:
+      errorCF("feishu", "lark-cli config init failed", {"app_id": appID, "code": $code}.toTable)
+  except Exception as e:
+    errorCF("feishu", "lark-cli config init error", {"error": e.msg}.toTable)
+
+# --- Channel constructor ---
 
 proc newFeishuChannel*(cfg: FeishuConfig, bus: MessageBus): FeishuChannel =
   let base = newBaseChannel("feishu", bus, cfg.allow_from)
-  return FeishuChannel(
+  result = FeishuChannel(
     bus: base.bus,
     name: base.name,
     allowList: base.allowList,
     running: false,
-    appID: cfg.app_id,
-    appSecret: cfg.app_secret
+    apps: @[],
+    typing: initTable[string, FeishuTypingState](),
+    messageCache: initTable[string, float](),
+    larkCliBin: findLarkCli()
   )
-
-proc getTenantAccessToken(c: FeishuChannel) {.async.} =
-  let client = newAsyncHttpClient()
-  let url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
-  let payload = %*{"app_id": c.appID, "app_secret": c.appSecret}
-  try:
-    let response = await client.post(url, $payload)
-    let body = await response.body
-    let res = parseJson(body)
-    if res.hasKey("tenant_access_token"):
-      c.token = res["tenant_access_token"].getStr()
-      infoC("feishu", "Obtained Feishu tenant access token")
-    else:
-      errorCF("feishu", "Failed to get token", {"response": body}.toTable)
-  except Exception as e:
-    errorCF("feishu", "Auth error", {"error": e.msg}.toTable)
-  finally:
-    client.close()
-
-proc feishuGatewayLoop(c: FeishuChannel) {.async.} =
-  while c.running:
-    try:
-      if c.ws == nil:
-        await sleepAsync(5000)
-        continue
-      let data = await c.ws.receiveStrPacket()
-      if data == "": break
-      let msg = parseJson(data)
-
-      # Handle Feishu WebSocket events
-      if msg.hasKey("header") and msg["header"].hasKey("event_type"):
-        let eventType = msg["header"]["event_type"].getStr()
-        if eventType == "im.message.receive_v1":
-          let event = msg["event"]
-          let sender = event["sender"]
-          let message = event["message"]
-
-          let chatID = message["chat_id"].getStr()
-          let senderID = if sender.hasKey("sender_id"):
-                           sender["sender_id"].getOrDefault("open_id").getStr()
-                         else: "unknown"
-
-          var content = ""
-          if message["msg_type"].getStr() == "text":
-            let contentJson = parseJson(message["content"].getStr())
-            content = contentJson["text"].getStr()
-          else:
-            content = "[Non-text message]"
-
-          infoCF("feishu", "Received message", {"sender": senderID}.toTable)
-          c.handleMessage(senderID, chatID, content)
-
-    except Exception as e:
-      errorCF("feishu", "Gateway error", {"error": e.msg}.toTable)
-      await sleepAsync(5000)
+  for appCfg in cfg.apps:
+    result.apps.add(FeishuAppInstance(
+      appID: appCfg.app_id,
+      appSecret: appCfg.app_secret,
+      enabled: (if options.isSome(appCfg.enabled): options.get(appCfg.enabled) else: true)
+    ))
+  initLock(result.cacheLock)
+  result.loadCache()
+  result.pruneCache()
 
 method name*(c: FeishuChannel): string = "feishu"
 
 method start*(c: FeishuChannel) {.async.} =
-  if c.appID == "" or c.appSecret == "": return
-  infoC("feishu", "Starting Feishu channel (WS mode)...")
-  await c.getTenantAccessToken()
+  if c.apps.len == 0: return
+  if c.running:
+    infoC("feishu", "Feishu channel already running, skipping start")
+    return
 
-  let client = newAsyncHttpClient()
-  client.headers["Authorization"] = "Bearer " & c.token
-  try:
-    # Simplified Lark WS handshake
-    let url = "https://open.feishu.cn/open-apis/ws/v1/endpoint"
-    let response = await client.post(url, "")
-    let body = await response.body
-    let res = parseJson(body)
-    if res.hasKey("data") and res["data"].hasKey("url"):
-      let wsUrl = res["data"]["url"].getStr()
-      c.ws = await newWebSocket(wsUrl)
-      c.running = true
-      discard feishuGatewayLoop(c)
-      infoC("feishu", "Feishu connected via WebSocket")
-    else:
-      c.running = true
-      infoC("feishu", "Feishu started in send-only mode (WS failed)")
-  except Exception as e:
-    errorCF("feishu", "WS handshake failed", {"error": e.msg}.toTable)
-    c.running = true
-  finally:
-    client.close()
+  if c.larkCliBin.len == 0:
+    errorC("feishu", "lark-cli binary not found. Build with: cd thridparty/cli && make build")
+    return
+
+  infoC("feishu", "Starting Feishu channel via lark-cli...")
+  c.running = true
+
+  for app in c.apps:
+    if not app.enabled:
+      infoCF("feishu", "Feishu app disabled", {"app_id": app.appID}.toTable)
+      continue
+
+    # Ensure lark-cli config exists for this app
+    let configDir = getNimClawDir() / "channels" / "feishu" / "lark-cli-" & app.appID
+    if not fileExists(configDir / "config.yaml"):
+      initLarkCliConfig(c.larkCliBin, app.appID, app.appSecret)
+
+    let env = newStringTable(modeCaseSensitive)
+    env["LARK_CLI_CONFIG_DIR"] = configDir
+
+    infoCF("feishu", "Starting lark-cli event subscriber", {"app_id": app.appID}.toTable)
+    app.subscribeProcess = startProcess(
+      c.larkCliBin,
+      args = ["event", "+subscribe", "--event-types", "im.message.receive_v1", "--compact", "--quiet"],
+      env = env,
+      options = {poUsePath}
+    )
+    createThread(app.subscriberThread, eventReader, (app.subscribeProcess, c, app.appID))
+
+  infoC("feishu", "Feishu event subscribers started")
 
 method stop*(c: FeishuChannel) {.async.} =
   c.running = false
-  if c.ws != nil: c.ws.close()
+  for app in c.apps:
+    if app.subscribeProcess != nil:
+      infoCF("feishu", "Stopping lark-cli subscriber", {"app_id": app.appID}.toTable)
+      try:
+        app.subscribeProcess.terminate()
+        discard app.subscribeProcess.waitForExit(3000)
+        if app.subscribeProcess.running:
+          app.subscribeProcess.kill()
+        app.subscribeProcess.close()
+      except: discard
+    joinThread(app.subscriberThread)
 
 method send*(c: FeishuChannel, msg: OutboundMessage) {.async.} =
-  if not c.running: return
-  let client = newAsyncHttpClient()
-  client.headers["Authorization"] = "Bearer " & c.token
-  client.headers["Content-Type"] = "application/json"
-  let url = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id"
-  let payload = %*{
-    "receive_id": msg.chat_id,
-    "msg_type": "text",
-    "content": $ %*{"text": msg.content}
-  }
+  if not c.running or c.apps.len == 0: return
+  if c.larkCliBin.len == 0: return
+
+  let replyID = msg.reply_to_message_id
+  let typingKey = msg.chat_id & ":" & replyID
+
+  # Resolve which app to use
+  var effectiveAppID = msg.app_id
+  if effectiveAppID.len == 0 and c.typing.hasKey(typingKey):
+    effectiveAppID = c.typing[typingKey].appID
+
+  var app: FeishuAppInstance = nil
+  if effectiveAppID.len > 0:
+    for a in c.apps:
+      if a.appID == effectiveAppID:
+        app = a
+        break
+    if app != nil and not app.enabled: return
+  if app.isNil:
+    for a in c.apps:
+      if a.enabled:
+        app = a
+        break
+  if app.isNil: return
+
+  let configDir = getNimClawDir() / "channels" / "feishu" / "lark-cli-" & app.appID
+  let env = newStringTable(modeCaseSensitive)
+  env["LARK_CLI_CONFIG_DIR"] = configDir
+
+  # Handle typing indicator (reaction-based) via REST API since lark-cli doesn't have a reaction shortcut
+  if msg.kind == Typing:
+    if replyID.len == 0: return
+    if not c.typing.hasKey(typingKey):
+      # Use lark-cli api for reactions
+      try:
+        let reactionData = $ %*{"reaction_type": {"emoji_type": "Typing"}}
+        let p = startProcess(c.larkCliBin,
+          args = ["api", "POST", "/open-apis/im/v1/messages/" & replyID & "/reactions",
+                  "--data", reactionData, "--as", "bot", "--format", "data"],
+          env = env, options = {poUsePath})
+        let output = p.outputStream.readAll()
+        let code = p.waitForExit(10000)
+        p.close()
+        if code == 0:
+          try:
+            let res = parseJson(output)
+            let rid = res.getOrDefault("reaction_id").getStr()
+            if rid.len > 0:
+              c.typing[typingKey] = FeishuTypingState(reactionID: rid, appID: app.appID)
+          except: discard
+      except Exception as e:
+        errorCF("feishu", "Typing reaction error", {"error": e.msg}.toTable)
+    return
+
+  # Clear typing indicator before sending
+  if replyID.len > 0 and c.typing.hasKey(typingKey):
+    let t = c.typing[typingKey]
+    c.typing.del(typingKey)
+    try:
+      let p = startProcess(c.larkCliBin,
+        args = ["api", "DELETE", "/open-apis/im/v1/messages/" & replyID & "/reactions/" & t.reactionID,
+                "--as", "bot"],
+        env = env, options = {poUsePath})
+      discard p.waitForExit(5000)
+      p.close()
+    except: discard
+
+  # Build send/reply command
+  let cardOpt = tryExtractInteractiveCard(msg.content)
+  var args: seq[string] = @[]
+
+  if replyID.len > 0:
+    args = @["im", "+messages-reply", "--message-id", replyID]
+    if options.isSome(cardOpt):
+      args.add("--msg-type")
+      args.add("interactive")
+      args.add("--content")
+      args.add(options.get(cardOpt))
+    else:
+      args.add("--msg-type")
+      args.add("post")
+      args.add("--content")
+      args.add(buildPostContent(msg.content))
+  else:
+    let idType = if msg.chat_id.startsWith("ou_"): "--user-id" else: "--chat-id"
+    args = @["im", "+messages-send", idType, msg.chat_id]
+    if options.isSome(cardOpt):
+      args.add("--msg-type")
+      args.add("interactive")
+      args.add("--content")
+      args.add(options.get(cardOpt))
+    else:
+      args.add("--msg-type")
+      args.add("post")
+      args.add("--content")
+      args.add(buildPostContent(msg.content))
+
+  args.add("--as")
+  args.add("bot")
+
+  infoCF("feishu", "Sending via lark-cli", {"cmd": args.join(" "), "chat": msg.chat_id}.toTable)
+
   try:
-    let resp = await client.post(url, $payload)
-    if not resp.status.startsWith("200"):
-      let body = await resp.body
-      errorCF("feishu", "Send failed", {"status": resp.status, "response": body}.toTable)
+    let p = startProcess(c.larkCliBin, args = args, env = env, options = {poUsePath})
+    let output = p.outputStream.readAll()
+    let errOutput = p.errorStream.readAll()
+    let code = p.waitForExit(30000)
+    p.close()
+
+    if code != 0:
+      errorCF("feishu", "Send failed", {"code": $code, "stderr": errOutput, "stdout": output}.toTable)
+    else:
+      infoCF("feishu", "Send ok", {"chat": msg.chat_id}.toTable)
+
+      # Check for interactive card upgrade placeholder fallback
+      if options.isSome(cardOpt):
+        try:
+          let res = parseJson(output)
+          let msgId = res.getOrDefault("message_id").getStr()
+          if msgId.len > 0:
+            var fbOpt = tryExtractAuthFallback(msg.content)
+            if options.isNone(fbOpt):
+              fbOpt = tryExtractAuthFallbackFromCard(options.get(cardOpt))
+            if options.isSome(fbOpt):
+              let (u, userCode, expiresIn) = options.get(fbOpt)
+              var fb = "如未看到授权卡片按钮，可使用以下信息完成授权：\n\n"
+              if u.len > 0: fb &= "授权链接：" & u & "\n"
+              if userCode.len > 0: fb &= "验证码：**" & userCode & "**\n"
+              if expiresIn > 0: fb &= "有效期：" & $(max(expiresIn div 60, 1)) & " 分钟\n"
+              var fbArgs = @["im", "+messages-send"]
+              let idType = if msg.chat_id.startsWith("ou_"): "--user-id" else: "--chat-id"
+              fbArgs.add(idType)
+              fbArgs.add(msg.chat_id)
+              fbArgs.add("--text")
+              fbArgs.add(fb)
+              fbArgs.add("--as")
+              fbArgs.add("bot")
+              let fbP = startProcess(c.larkCliBin, args = fbArgs, env = env, options = {poUsePath})
+              discard fbP.waitForExit(10000)
+              fbP.close()
+        except: discard
   except Exception as e:
     errorCF("feishu", "Send error", {"error": e.msg}.toTable)
-  finally:
-    client.close()
 
 method isRunning*(c: FeishuChannel): bool = c.running
