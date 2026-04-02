@@ -19,6 +19,7 @@ type
 
   LLMResponse* = object
     content*: string
+    reasoning_content*: string
     tool_calls*: seq[ToolCall]
     finish_reason*: string
     usage*: UsageInfo
@@ -26,13 +27,15 @@ type
   Message* = object
     role*: string
     content*: string
+    reasoning_content*: string
     tool_calls*: seq[ToolCall]
     tool_call_id*: string
+    name*: string
 
   ToolFunctionDefinition* = object
     name*: string
     description*: string
-    parameters*: Table[string, JsonNode]
+    parameters*: JsonNode
 
   ToolDefinition* = object
     `type`*: string

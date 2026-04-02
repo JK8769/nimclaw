@@ -1,6 +1,6 @@
-import std/[asyncdispatch, httpclient, json, strutils, tables, locks, times]
+import std/[asyncdispatch, httpclient, json, strutils, tables, locks]
 import base
-import ../bus, ../bus_types, ../config, ../logger, ../utils
+import ../bus, ../bus_types, ../config, ../logger
 import ws
 
 type
@@ -86,7 +86,7 @@ method send*(c: DingTalkChannel, msg: OutboundMessage) {.async.} =
   let payload = %*{
     "msgtype": "markdown",
     "markdown": {
-      "title": "PicoClaw",
+      "title": "Nimclaw",
       "text": msg.content
     }
   }

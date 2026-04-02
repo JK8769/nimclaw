@@ -1,4 +1,4 @@
-import std/[os, times, strutils, json, syncio, tables]
+import std/[times, strutils, json, syncio, tables]
 import jsony
 
 type

@@ -1,4 +1,4 @@
-import std/[os, times, strutils, json, tables, locks]
+import std/[os, times, tables, locks]
 import jsony
 import providers/types as providers_types
 
@@ -93,6 +93,19 @@ proc truncateHistory*(sm: SessionManager, key: string, keepLast: int) =
   if session.messages.len <= keepLast: return
   session.messages = session.messages[session.messages.len - keepLast .. ^1]
   session.updated = getTime().toUnixFloat()
+
+proc clearSession*(sm: SessionManager, key: string) =
+  acquire(sm.lock)
+  defer: release(sm.lock)
+  if sm.sessions.hasKey(key):
+    sm.sessions[key].messages = @[]
+    sm.sessions[key].summary = ""
+    sm.sessions[key].updated = getTime().toUnixFloat()
+    if sm.storage != "":
+      let path = sm.storage / (key & ".json")
+      if fileExists(path):
+        try: removeFile(path)
+        except: discard
 
 proc save*(sm: SessionManager, session: Session) =
   if sm.storage == "": return

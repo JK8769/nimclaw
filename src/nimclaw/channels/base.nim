@@ -37,13 +37,15 @@ method isAllowed*(c: BaseChannel, senderID: string): bool =
     if senderID == allowed: return true
   return false
 
-proc handleMessage*(c: BaseChannel, senderID, chatID, content: string, media: seq[string] = @[], metadata: Table[string, string] = initTable[string, string]()) =
+proc handleMessage*(c: BaseChannel, senderID, chatID, content: string, media: seq[string] = @[], metadata: Table[string, string] = initTable[string, string](), recipientID: string = "") =
   if not c.isAllowed(senderID): return
 
-  let sessionKey = c.name & ":" & chatID
+  # Use channel:chatID:senderID for all sessions to ensure maximum isolation by default.
+  let sessionKey = c.name & ":" & chatID & ":" & senderID
   let msg = InboundMessage(
     channel: c.name,
     sender_id: senderID,
+    recipient_id: recipientID,
     chat_id: chatID,
     content: content,
     media: media,

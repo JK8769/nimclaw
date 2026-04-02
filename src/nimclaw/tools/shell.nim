@@ -1,4 +1,4 @@
-import std/[os, osproc, json, asyncdispatch, tables, strutils, times, streams]
+import std/[os, osproc, json, asyncdispatch, tables, strutils, times, streams, strtabs]
 import regex
 import types
 
@@ -6,8 +6,8 @@ type
   ExecTool* = ref object of Tool
     workingDir*: string
     timeout*: Duration
-    denyPatterns*: seq[Regex]
-    allowPatterns*: seq[Regex]
+    denyPatterns*: seq[Regex2]
+    allowPatterns*: seq[Regex2]
     restrictToWorkspace*: bool
 
 proc newExecTool*(workingDir: string): ExecTool =
@@ -21,9 +21,9 @@ proc newExecTool*(workingDir: string): ExecTool =
     r"\b(shutdown|reboot|poweroff)\b",
     r":\(\)\s*\{.*\};\s*:"
   ]
-  var denyPatterns: seq[Regex] = @[]
+  var denyPatterns: seq[Regex2] = @[]
   for p in denyPatternsStrings:
-    denyPatterns.add(re(p))
+    denyPatterns.add(re2(p))
 
   ExecTool(
     workingDir: workingDir,
@@ -73,9 +73,26 @@ proc guardCommand(t: ExecTool, command, cwd: string): string =
 
   return ""
 
+const SAFE_ENV_VARS = [
+  "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR", "PWD"
+]
+
+proc normalizeCommandInput*(command: string): string =
+  let trimmed = command.strip()
+  if trimmed.startsWith("```") and trimmed.endsWith("```"):
+    let lines = trimmed.splitLines()
+    if lines.len >= 2:
+      # Return everything between the first and last line
+      var inner = lines[1 .. ^2].join("\n").strip()
+      if inner.len > 0: return inner
+  return trimmed
+
 method execute*(t: ExecTool, args: Table[string, JsonNode]): Future[string] {.async.} =
   if not args.hasKey("command"): return "Error: command is required"
-  let command = args["command"].getStr()
+  
+  let rawCommand = args["command"].getStr()
+  let command = normalizeCommandInput(rawCommand)
+  
   var cwd = t.workingDir
   if args.hasKey("working_dir") and args["working_dir"].getStr() != "":
     cwd = args["working_dir"].getStr()
@@ -87,14 +104,13 @@ method execute*(t: ExecTool, args: Table[string, JsonNode]): Future[string] {.as
   if guardErr != "":
     return "Error: " & guardErr
 
-  # Nim's asyncdispatch doesn't have a direct async process execution with timeout easily available in stdlib
-  # but we can use execProcess or similar, or just run it in a thread if needed.
-  # For now, let's use a simple synchronous execProcess as a placeholder if we're in a single-threaded async loop,
-  # or better, use a thread-pool.
+  # Build a safe environment string table
+  var safeEnv = newStringTable(modeCaseSensitive)
+  for key in SAFE_ENV_VARS:
+    if existsEnv(key):
+      safeEnv[key] = getEnv(key)
 
-  # Actually, std/osproc has startProcess and we can poll it.
-
-  var p = startProcess("sh", workingDir = cwd, args = ["-c", command], options = {poStdErrToStdOut})
+  var p = startProcess("/bin/sh", workingDir = cwd, args = ["-c", command], env = safeEnv, options = {poStdErrToStdOut})
   let startTime = now()
   var output = ""
 

@@ -1,12 +1,16 @@
 import std/[os, json, asyncdispatch, tables, strutils]
 import types
+import path_security
+import iam_policies
 
 type
-  EditFileTool* = ref object of Tool
-    allowedDir*: string
+  EditFileTool* = ref object of ContextualTool
+    workspaceDir*: string
+    allowedPaths*: seq[string]
 
-proc newEditFileTool*(allowedDir: string): EditFileTool =
-  EditFileTool(allowedDir: allowedDir)
+
+proc newEditFileTool*(workspaceDir: string, allowedPaths: seq[string] = @[]): EditFileTool =
+  EditFileTool(workspaceDir: workspaceDir, allowedPaths: allowedPaths)
 
 method name*(t: EditFileTool): string = "edit_file"
 method description*(t: EditFileTool): string = "Edit a file by replacing old_text with new_text. The old_text must exist exactly in the file."
@@ -39,12 +43,14 @@ method execute*(t: EditFileTool, args: Table[string, JsonNode]): Future[string] 
   let oldText = args["old_text"].getStr()
   let newText = args["new_text"].getStr()
 
-  var resolvedPath = if isAbsolute(path): normalizedPath(path) else: absolutePath(path)
+  let resolvedPath = resolveAndCheckPath(path, t.workspaceDir, t.allowedPaths)
+  if resolvedPath.startsWith("Error:"): return resolvedPath
 
-  if t.allowedDir != "":
-    let allowedAbs = absolutePath(t.allowedDir)
-    if not resolvedPath.startsWith(allowedAbs):
-      return "Error: path $1 is outside allowed directory $2".format(path, t.allowedDir)
+  # IAM Policy Check
+  let wsResolved = expandFilename(t.workspaceDir)
+  if not checkAccess(t.role, t.agentName, resolvedPath, wsResolved, akWrite):
+    return "Error: IAM Permission Denied (Edit/Write) for path: " & path
+
 
   if not fileExists(resolvedPath):
     return "Error: file not found: " & path
@@ -65,13 +71,16 @@ method execute*(t: EditFileTool, args: Table[string, JsonNode]): Future[string] 
     return "Error: failed to edit file: " & e.msg
 
 type
-  AppendFileTool* = ref object of Tool
+  AppendFileTool* = ref object of ContextualTool
+    workspaceDir*: string
+    allowedPaths*: seq[string]
 
-proc newAppendFileTool*(): AppendFileTool =
-  AppendFileTool()
+
+proc newAppendFileTool*(workspaceDir: string, allowedPaths: seq[string] = @[]): AppendFileTool =
+  AppendFileTool(workspaceDir: workspaceDir, allowedPaths: allowedPaths)
 
 method name*(t: AppendFileTool): string = "append_file"
-method description*(t: AppendFileTool): string = "Append content to the end of a file"
+method description*(t: AppendFileTool): string = "Append content to the end of a file. Use this for logging or modifying code. Do NOT use this for reminders (use cron) or for storing long-term abstract facts (use memory_store). If writing to user memory/notes directly, ensure the path is correctly prefixed with 'memory/' or 'notes/'."
 method parameters*(t: AppendFileTool): Table[string, JsonNode] =
   {
     "type": %"object",
@@ -95,8 +104,17 @@ method execute*(t: AppendFileTool, args: Table[string, JsonNode]): Future[string
   let path = args["path"].getStr()
   let content = args["content"].getStr()
 
+  let resolvedPath = resolveAndCheckPath(path, t.workspaceDir, t.allowedPaths)
+  if resolvedPath.startsWith("Error:"): return resolvedPath
+
+  # IAM Policy Check
+  let wsResolved = expandFilename(t.workspaceDir)
+  if not checkAccess(t.role, t.agentName, resolvedPath, wsResolved, akWrite):
+    return "Error: IAM Permission Denied (Append/Write) for path: " & path
+
+
   try:
-    let f = open(path, fmAppend)
+    let f = open(resolvedPath, fmAppend)
     f.write(content)
     f.close()
     return "Successfully appended to " & path

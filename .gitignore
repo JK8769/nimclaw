@@ -1,5 +1,5 @@
 # Compiled binaries
-nimclaw
+/nimclaw
 test_cortex
 test_loop
 test_prompt

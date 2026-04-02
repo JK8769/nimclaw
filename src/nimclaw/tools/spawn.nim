@@ -5,14 +5,10 @@ import subagent
 type
   SpawnTool* = ref object of ContextualTool
     manager*: SubagentManager
-    originChannel*: string
-    originChatID*: string
 
 proc newSpawnTool*(manager: SubagentManager): SpawnTool =
   SpawnTool(
-    manager: manager,
-    originChannel: "cli",
-    originChatID: "direct"
+    manager: manager
   )
 
 method name*(t: SpawnTool): string = "spawn"
@@ -28,21 +24,29 @@ method parameters*(t: SpawnTool): Table[string, JsonNode] =
       "label": {
         "type": "string",
         "description": "Optional short label for the task (for display)"
+      },
+      "agent": {
+        "type": "string",
+        "description": "Optional named agent profile for provider/model override"
       }
     },
     "required": %["task"]
   }.toTable
 
-method setContext*(t: SpawnTool, channel, chatID: string) =
-  t.originChannel = channel
-  t.originChatID = chatID
-
 method execute*(t: SpawnTool, args: Table[string, JsonNode]): Future[string] {.async.} =
-  if not args.hasKey("task"): return "Error: task is required"
-  let task = args["task"].getStr()
-  let label = if args.hasKey("label"): args["label"].getStr() else: ""
+  if not args.hasKey("task"): return "Error: Missing 'task' parameter"
+  let task = args["task"].getStr().strip()
+  if task == "": return "Error: 'task' must not be empty"
+
+  let label = if args.hasKey("label"): args["label"].getStr() else: "subagent"
+
+  var agentName = ""
+  if args.hasKey("agent"):
+    agentName = args["agent"].getStr().strip()
+    if agentName == "": return "Error: 'agent' must not be empty"
 
   if t.manager == nil:
-    return "Error: Subagent manager not configured"
+    return "Error: Spawn tool not connected to SubagentManager"
 
-  return t.manager.spawn(task, label, t.originChannel, t.originChatID)
+  let taskObj = t.manager.spawn(task, label, t.channel, t.chatID, t.sessionKey, t.senderID, t.recipientID, t.role, t.agentName, t.agentID, t.logicalUserID, agentName)
+  return "Spawned subagent '" & label & "' with ID " & taskObj.id & " for task: " & task

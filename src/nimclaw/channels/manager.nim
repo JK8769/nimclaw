@@ -1,6 +1,6 @@
 import std/[asyncdispatch, tables, locks, strutils]
 import base as channel_base
-import telegram, discord, whatsapp, dingtalk, maixcam, feishu, qq
+import telegram, discord, whatsapp, dingtalk, maixcam, feishu, qq, nmobile
 import ../bus, ../bus_types, ../config, ../logger
 
 type
@@ -42,6 +42,9 @@ proc initChannels*(m: Manager) =
   if m.config.channels.qq.enabled:
     m.channels["qq"] = newQQChannel(m.config.channels.qq, m.bus)
 
+  if m.config.channels.nmobile.enabled:
+    m.channels["nmobile"] = newNMobileChannel(m.config, m.bus)
+
   infoCF("channels", "Channel initialization completed", {"enabled_channels": $m.channels.len}.toTable)
 
 proc dispatchOutbound(m: Manager) {.async.} =
@@ -50,14 +53,20 @@ proc dispatchOutbound(m: Manager) {.async.} =
     let msg = await m.bus.subscribeOutbound()
     if m.channels.hasKey(msg.channel):
       let channel = m.channels[msg.channel]
-      try:
-        await channel.send(msg)
-      except Exception as e:
-        errorCF("channels", "Error sending message to channel", {"channel": msg.channel, "error": e.msg}.toTable)
+      # Launch in background so one slow channel doesn't block others
+      discard (proc() {.async.} =
+        try:
+          await channel.send(msg)
+        except Exception as e:
+          errorCF("channels", "Error sending message to channel", {"channel": msg.channel, "error": e.msg}.toTable)
+      )()
     else:
       warnCF("channels", "Unknown channel for outbound message", {"channel": msg.channel}.toTable)
 
 proc startAll*(m: Manager) {.async.} =
+  if m.running:
+    warnC("channels", "Channel manager already running, skipping startAll")
+    return
   if m.channels.len == 0:
     warnC("channels", "No channels enabled")
     return
