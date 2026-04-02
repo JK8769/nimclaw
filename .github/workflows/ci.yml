@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    - name: Setup Nim
+      uses: iffy/install-nim@v4
+      with:
+        version: '2.0.0'
+    - name: Setup Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.23'
+    - name: Install Nim Dependencies
+      run: nimble install -y
+    - name: Build NKN Bridge
+      run: ./tools/build_libnkn.sh
+    - name: Build lark-cli
+      run: ./tools/build_lark_cli.sh
+    - name: Build NimClaw
+      run: nimble build
+    - name: Run Tests
+      run: nimble test

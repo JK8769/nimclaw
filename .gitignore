@@ -1,5 +1,6 @@
 # Compiled binaries
 /nimclaw
+bin/
 test_cortex
 test_loop
 test_prompt
@@ -9,6 +10,10 @@ src/nimclaw.debug
 src/nimclaw/test_env
 src/test_sigbus
 src/test_xml_parse
+src/nimclaw/tools/cron
+src/nimclaw/tools/forge
+src/nimclaw/skills/loader
+src/nimclaw/tests/test_relations_ld_star
 tests/test_*[!.nim]
 tests/debug_*[!.nim]
 tests/diagnostic_*[!.nim]

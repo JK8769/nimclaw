@@ -1,0 +1,109 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            nim_target: linux
+            artifact: nimclaw-linux-amd64
+          - os: macos-latest
+            goos: darwin
+            goarch: arm64
+            nim_target: macosx
+            artifact: nimclaw-darwin-arm64
+          - os: windows-latest
+            goos: windows
+            goarch: amd64
+            nim_target: windows
+            artifact: nimclaw-windows-amd64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Setup Nim
+      uses: iffy/install-nim@v4
+      with:
+        version: '2.2.0'
+
+    - name: Setup Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.23'
+
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+
+    - name: Install Nim dependencies
+      run: nimble install -y
+
+    - name: Build NKN bridge
+      shell: bash
+      run: ./tools/build_libnkn.sh ${{ matrix.goos }} ${{ matrix.goarch }}
+
+    - name: Build lark-cli
+      shell: bash
+      run: ./tools/build_lark_cli.sh ${{ matrix.goos }} ${{ matrix.goarch }}
+
+    - name: Build NimClaw
+      run: nimble build
+
+    - name: Package (Unix)
+      if: matrix.goos != 'windows'
+      shell: bash
+      run: |
+        mkdir -p dist/${{ matrix.artifact }}
+        cp nimclaw dist/${{ matrix.artifact }}/
+        cp src/nimclaw/libnkn/nkn_bridge dist/${{ matrix.artifact }}/
+        cp thridparty/cli/lark-cli dist/${{ matrix.artifact }}/
+        cp -r templates dist/${{ matrix.artifact }}/
+        cp README.md LICENSE dist/${{ matrix.artifact }}/
+        cd dist && tar czf ${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}
+
+    - name: Package (Windows)
+      if: matrix.goos == 'windows'
+      shell: bash
+      run: |
+        mkdir -p dist/${{ matrix.artifact }}
+        cp nimclaw.exe dist/${{ matrix.artifact }}/
+        cp src/nimclaw/libnkn/nkn_bridge.exe dist/${{ matrix.artifact }}/
+        cp thridparty/cli/lark-cli.exe dist/${{ matrix.artifact }}/
+        cp -r templates dist/${{ matrix.artifact }}/
+        cp README.md LICENSE dist/${{ matrix.artifact }}/
+        cd dist && 7z a ${{ matrix.artifact }}.zip ${{ matrix.artifact }}
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.artifact }}
+        path: dist/${{ matrix.artifact }}.*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v2
+      with:
+        generate_release_notes: true
+        files: artifacts/**/*
