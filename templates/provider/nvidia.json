@@ -1,0 +1,13 @@
+{
+  "name": "Nvidia",
+  "apiBase": "https://integrate.api.nvidia.com/v1",
+  "apiKey": "${NVIDIA_API_KEY}",
+  "defaultModel": "nvidia/nemotron-3-super-120b-a12b",
+  "models": [
+    "nvidia/nemotron-3-super-120b-a12b",
+    "minimaxai/minimax-m2.5",
+    "moonshotai/kimi-k2-instruct",
+    "moonshotai/kimi-k2-thinking",
+    "moonshotai/kimi-k2.5"
+  ]
+}

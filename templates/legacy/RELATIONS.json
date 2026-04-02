@@ -1,0 +1,22 @@
+[
+  {
+    "userID": "user",
+    "agentName": "",
+    "role": "boss",
+    "trustLevel": 100,
+    "etiquette": "",
+    "identifiers": {}
+  },
+  {
+    "userID": "customer_the_boss_3bd",
+    "agentName": "secretary",
+    "role": "customer",
+    "trustLevel": 50,
+    "etiquette": "",
+    "identifiers": {
+      "nmobile": [
+        "3bd4c07fadca56f92c3d8bd18b097dc3406e27df07650ab35ade0121ce7fde34"
+      ]
+    }
+  }
+]

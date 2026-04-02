@@ -1,0 +1,5 @@
+{
+  "name": "AnyGen",
+  "gitUrl": "https://github.com/AnyGenIO/anygen-suite-skill",
+  "apiKey": "${ANYGEN_API_KEY}"
+}

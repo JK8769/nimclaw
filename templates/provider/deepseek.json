@@ -1,0 +1,10 @@
+{
+  "name": "DeepSeek",
+  "apiBase": "https://api.deepseek.com",
+  "apiKey": "${DEEPSEEK_API_KEY}",
+  "defaultModel": "deepseek-chat",
+  "models": [
+    "deepseek-chat",
+    "deepseek-reasoner"
+  ]
+}

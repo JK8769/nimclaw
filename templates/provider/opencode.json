@@ -1,0 +1,11 @@
+{
+  "name": "Opencode AI Go",
+  "apiBase": "https://opencode.ai/zen/go/v1",
+  "apiKey": "${OPENCODE_API_KEY}",
+  "defaultModel": "opencode/kimi-k2.5",
+  "models": [
+    "opencode/glm-5",
+    "opencode/kimi-k2.5",
+    "opencode/minimax-m2.5"
+  ]
+}

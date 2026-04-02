@@ -1,0 +1,11 @@
+[
+  {
+    "code": "R2F-FA6",
+    "agentName": "secretary",
+    "customerName": "The Architect",
+    "role": "customer",
+    "maxUses": 1,
+    "expiry": 1773915201,
+    "pinless": false
+  }
+]

@@ -1,0 +1,9 @@
+[submodule "thridparty/cli"]
+	path = thridparty/cli
+	url = https://github.com/larksuite/cli.git
+[submodule "thridparty/nMobile"]
+	path = thridparty/nMobile
+	url = https://github.com/nknorg/nMobile.git
+[submodule "thridparty/app_4jsyrx66gf80g"]
+	path = thridparty/app_4jsyrx66gf80g
+	url = https://github.com/JK8769/nimclaw.git

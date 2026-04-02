@@ -1,0 +1,72 @@
+# Compiled binaries
+nimclaw
+test_cortex
+test_loop
+test_prompt
+tmp_*
+src/nimclaw.out
+src/nimclaw.debug
+src/nimclaw/test_env
+src/test_sigbus
+src/test_xml_parse
+tests/test_*[!.nim]
+tests/debug_*[!.nim]
+tests/diagnostic_*[!.nim]
+tests/repro_*[!.nim]
+tests/verify_*[!.nim]
+tests/.!*
+
+# Logs
+*.log
+
+# Secrets
+.env
+.env.*
+.keys
+
+# Debug/scratch files
+diag_jerry.nim
+verify_load.nim
+opencode_*.json
+opencode_*.txt
+env_out.txt
+
+# Dependencies
+node_modules/
+
+# Nim build cache
+nimcache/
+nimblecache/
+
+# Generated docs
+docs/
+
+# Shared libraries
+*.dylib
+*.so
+*.dll
+
+# NKN bridge binary (built via tools/build_libnkn.sh)
+src/nimclaw/libnkn/nkn_bridge
+src/nimclaw/libnkn/nkn_bridge.exe
+
+# lark-cli binary (built via tools/build_lark_cli.sh)
+thridparty/cli/lark-cli
+thridparty/cli/lark-cli.exe
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Runtime state (local dev)
+.nimclaw/
+memory/
+
+# Go module cache (libnkn build)
+src/nimclaw/libnkn/go.sum
+
+# Scratch/test artifacts
+test_json
+test_feishu_*.js
+package.json
+package-lock.json
