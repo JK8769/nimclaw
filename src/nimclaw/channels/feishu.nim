@@ -338,7 +338,7 @@ proc initLarkCliConfig(bin, appID, appSecret: string) =
     createDir(configDir)
   except: discard
   let env = newStringTable(modeCaseSensitive)
-  env["LARK_CLI_CONFIG_DIR"] = configDir
+  env["LARKSUITE_CLI_CONFIG_DIR"] = configDir
   try:
     let p = startProcess(bin, args = ["config", "init", "--app-id", appID, "--app-secret-stdin", "--brand", "feishu"],
                          env = env, options = {poUsePath})
@@ -403,7 +403,7 @@ method start*(c: FeishuChannel) {.async.} =
       initLarkCliConfig(c.larkCliBin, app.appID, app.appSecret)
 
     let env = newStringTable(modeCaseSensitive)
-    env["LARK_CLI_CONFIG_DIR"] = configDir
+    env["LARKSUITE_CLI_CONFIG_DIR"] = configDir
 
     infoCF("feishu", "Starting lark-cli event subscriber", {"app_id": app.appID}.toTable)
     app.subscribeProcess = startProcess(
@@ -458,7 +458,7 @@ method send*(c: FeishuChannel, msg: OutboundMessage) {.async.} =
 
   let configDir = getNimClawDir() / "channels" / "feishu" / "lark-cli-" & app.appID
   let env = newStringTable(modeCaseSensitive)
-  env["LARK_CLI_CONFIG_DIR"] = configDir
+  env["LARKSUITE_CLI_CONFIG_DIR"] = configDir
 
   # Handle typing indicator (reaction-based) via REST API since lark-cli doesn't have a reaction shortcut
   if msg.kind == Typing:
