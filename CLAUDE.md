@@ -16,8 +16,8 @@ git clone --recurse-submodules <repo-url>
 nimble install -y
 
 # Build Go bridges (requires Go 1.21+)
-./tools/build_libnkn.sh       # NKN/nMobile bridge subprocess
-./tools/build_lark_cli.sh     # Feishu/Lark CLI (requires Python 3)
+./thridparty/build_libnkn.sh       # NKN/nMobile bridge subprocess
+./thridparty/build_lark_cli.sh     # Feishu/Lark CLI (requires Python 3)
 
 # Build NimClaw (ssl + release + threads are default switches)
 nimble build

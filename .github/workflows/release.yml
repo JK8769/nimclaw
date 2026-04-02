@@ -55,11 +55,11 @@ jobs:
 
     - name: Build NKN bridge
       shell: bash
-      run: ./tools/build_libnkn.sh ${{ matrix.goos }} ${{ matrix.goarch }}
+      run: ./thridparty/build_libnkn.sh ${{ matrix.goos }} ${{ matrix.goarch }}
 
     - name: Build lark-cli
       shell: bash
-      run: ./tools/build_lark_cli.sh ${{ matrix.goos }} ${{ matrix.goarch }}
+      run: ./thridparty/build_lark_cli.sh ${{ matrix.goos }} ${{ matrix.goarch }}
 
     - name: Build NimClaw
       run: nimble build

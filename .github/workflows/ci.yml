@@ -24,9 +24,9 @@ jobs:
     - name: Install Nim Dependencies
       run: nimble install -y
     - name: Build NKN Bridge
-      run: ./tools/build_libnkn.sh
+      run: ./thridparty/build_libnkn.sh
     - name: Build lark-cli
-      run: ./tools/build_lark_cli.sh
+      run: ./thridparty/build_lark_cli.sh
     - name: Build NimClaw
       run: nimble build
     - name: Run Tests

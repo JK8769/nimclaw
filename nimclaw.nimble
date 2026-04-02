@@ -59,14 +59,14 @@ task snapshot, "Snapshot the current development .nimclaw directory":
     echo "No local .nimclaw directory found to snapshot."
 
 task build_nkn, "Build NKN bridge (requires Go 1.21+)":
-  exec "./tools/build_libnkn.sh"
+  exec "./thridparty/build_libnkn.sh"
 
 task build_lark, "Build lark-cli from submodule (requires Go 1.23+, Python 3)":
-  exec "./tools/build_lark_cli.sh"
+  exec "./thridparty/build_lark_cli.sh"
 
 task build_all, "Build NimClaw and all Go bridges":
-  exec "./tools/build_libnkn.sh"
-  exec "./tools/build_lark_cli.sh"
+  exec "./thridparty/build_libnkn.sh"
+  exec "./thridparty/build_lark_cli.sh"
   exec "nimble build"
 
 task test, "Run unit tests":

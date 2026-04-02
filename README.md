@@ -44,8 +44,8 @@ nimble build         # NimClaw only
 Cross-compile Go bridges for another platform:
 
 ```bash
-./tools/build_libnkn.sh linux amd64
-./tools/build_lark_cli.sh linux amd64
+./thridparty/build_libnkn.sh linux amd64
+./thridparty/build_lark_cli.sh linux amd64
 ```
 
 ### Prebuilt binaries (users)

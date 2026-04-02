@@ -51,11 +51,11 @@ docs/
 *.so
 *.dll
 
-# NKN bridge binary (built via tools/build_libnkn.sh)
+# NKN bridge binary (built via thridparty/build_libnkn.sh)
 src/nimclaw/libnkn/nkn_bridge
 src/nimclaw/libnkn/nkn_bridge.exe
 
-# lark-cli binary (built via tools/build_lark_cli.sh)
+# lark-cli binary (built via thridparty/build_lark_cli.sh)
 thridparty/cli/lark-cli
 thridparty/cli/lark-cli.exe
 

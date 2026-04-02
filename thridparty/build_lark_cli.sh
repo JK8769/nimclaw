@@ -3,8 +3,8 @@
 # Requires Go 1.23+ and Python 3 (for metadata fetching).
 #
 # Usage:
-#   ./tools/build_lark_cli.sh              # build for current platform
-#   ./tools/build_lark_cli.sh linux amd64  # cross-compile
+#   ./thridparty/build_lark_cli.sh              # build for current platform
+#   ./thridparty/build_lark_cli.sh linux amd64  # cross-compile
 #
 # The binary is placed in thridparty/cli/lark-cli (or .exe on Windows).
 

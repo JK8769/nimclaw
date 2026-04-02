@@ -3,8 +3,8 @@
 # Requires Go 1.21+ and CGO enabled.
 #
 # Usage:
-#   ./tools/build_libnkn.sh              # build for current OS/arch
-#   ./tools/build_libnkn.sh linux amd64  # cross-compile for linux/amd64
+#   ./thridparty/build_libnkn.sh              # build for current OS/arch
+#   ./thridparty/build_libnkn.sh linux amd64  # cross-compile for linux/amd64
 #
 # Output goes to src/nimclaw/libnkn/nkn_bridge
 
