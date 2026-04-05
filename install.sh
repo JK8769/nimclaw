@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # NimClaw installer — download pre-built binary for your platform.
 #
 # Usage:
@@ -10,7 +10,7 @@
 #   NIMCLAW_LIB_DIR      Override library/assets directory (default: ~/.local/lib/nimclaw)
 #   NIMCLAW_VERSION      Install a specific version (default: latest)
 
-set -euo pipefail
+set -eu
 
 REPO="JK8769/nimclaw"
 INSTALL_DIR="${NIMCLAW_INSTALL_DIR:-$HOME/.local/bin}"
