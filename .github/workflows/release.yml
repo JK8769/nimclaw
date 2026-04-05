@@ -25,10 +25,6 @@ jobs:
             goos: darwin
             goarch: arm64
             artifact: nimclaw-darwin-arm64
-          - os: macos-13
-            goos: darwin
-            goarch: amd64
-            artifact: nimclaw-darwin-amd64
 
     runs-on: ${{ matrix.os }}
 
@@ -51,7 +47,6 @@ jobs:
         echo "$PWD/nim-2.2.8/bin" >> $GITHUB_PATH
         export PATH="$PWD/nim-2.2.8/bin:$PATH"
         nim --version
-        nimble --version
 
     - name: Setup Go
       uses: actions/setup-go@v5
