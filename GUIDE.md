@@ -1,41 +1,120 @@
-# 🦞 NimClaw Getting Started Guide
+# NimClaw Setup Guide
 
-Welcome to **NimClaw**, your ultra-lightweight personal AI agent! This guide will help you set up your environment and start collaborating with your new AI partner.
+## Install
 
-## 1. Initial Setup
-If you haven't already, start by regularizing your environment.
+### Prebuilt binaries
+
+Download the latest release for your platform from [Releases](../../releases). Each release includes `nimclaw`, `nkn_bridge`, and `lark-cli`.
+
+### Build from source
+
+Requires Nim 2.0+, Go 1.21+, libcurl, and OpenSSL.
+
+```bash
+git clone --recurse-submodules https://github.com/JK8769/nimclaw
+cd nimclaw
+
+nimble install -y
+nimble build_all    # builds nimclaw + NKN bridge + lark-cli
+```
+
+To build components individually:
+
+```bash
+nimble build         # NimClaw only
+nimble build_nkn     # NKN bridge (Go 1.21+)
+nimble build_lark    # Feishu/Lark CLI (Go 1.23+, Python 3)
+```
+
+Cross-compile Go bridges:
+
+```bash
+./thridparty/build_libnkn.sh linux amd64
+./thridparty/build_lark_cli.sh linux amd64
+```
+
+## First-time setup
+
 ```bash
 ./nimclaw onboard
 ```
-This will set up your `.nimclaw` directory, initialize the world graph, and prepare default agents.
 
-## 2. Configure Your AI Provider
-NimClaw needs a brain! Link your preferred LLM provider:
-```bash
-./nimclaw provider add anthropic --api-key YOUR_KEY
-```
-*(You can also use `openai`, `deepseek`, or `groq`)*
+This creates your `~/.nimclaw/` directory, sets up the world graph, configures an LLM provider, and prepares the default agent (Lexi).
 
-## 3. Meet Lexi
-Lexi is your default collaborator. Start a conversation directly from your terminal:
+Override the config directory with:
+
 ```bash
-./nimclaw agent "Hello Lexi, can you help me organize my tasks?"
+export NIMCLAW_DIR=/path/to/config
 ```
 
-## 4. Explore Competencies (Skills)
-Enhance NimClaw with platform-level skills:
-- **Native Skills**: Place `SKILL.md` files in `.nimclaw/skills/`
-- **OpenClaw Plugins**: Place `openclaw.plugin.json` plugins in `.nimclaw/plugins/`
-- **Manage via CLI**:
-  ```bash
-  ./nimclaw competencies list
-  ./nimclaw competencies search
-  ```
+## Add a channel
 
-## 5. Useful Commands
-- `nimclaw status`: Check the health of your providers and channels.
-- `nimclaw doctor`: Run system diagnostics.
-- `nimclaw snapshot`: Create a restore point for your configuration.
+### Feishu / Lark
 
----
-*For deep technical details, check the `docs/` folder or visit the project repository.*
+1. Create an app at https://open.feishu.cn/app
+2. Enable the **Event Subscription** capability and add `im.message.receive_v1`
+3. Run:
+
+```bash
+./nimclaw channel add feishu <APP_ID> <APP_SECRET>
+```
+
+The secret is stored securely by lark-cli (macOS Keychain / Linux secret-service). Only the App ID is saved in your config.
+
+### Telegram
+
+Edit `~/.nimclaw/BASE.json` and set your bot token:
+
+```json
+"telegram": {
+  "enabled": true,
+  "token": "123456:ABC-DEF..."
+}
+```
+
+### Other channels
+
+Discord, QQ, DingTalk, WhatsApp, MaixCam, and nMobile are configured in the `channels` section of `BASE.json`. See [CLAUDE.md](CLAUDE.md) for the full config reference.
+
+## Talk to your agent
+
+From the terminal:
+
+```bash
+./nimclaw agent "Hello Lexi"
+```
+
+Or start the gateway to receive messages from connected channels:
+
+```bash
+./nimclaw gateway
+```
+
+## Add skills
+
+Place `SKILL.md` files in `~/.nimclaw/skills/` or OpenClaw plugins in `~/.nimclaw/plugins/`.
+
+```bash
+./nimclaw skills list
+./nimclaw skills search
+```
+
+## Useful commands
+
+| Command | Description |
+|---------|-------------|
+| `nimclaw status` | Check provider and channel health |
+| `nimclaw doctor` | Run system diagnostics |
+| `nimclaw models list` | List available models |
+| `nimclaw channel status` | Show channel status |
+| `nimclaw agents list` | List configured agents |
+
+## Development mode
+
+For local development, use `nimble dev` which sets `NIMCLAW_DIR` to `.nimclaw/` in the project root:
+
+```bash
+nimble dev onboard
+nimble dev gateway
+nimble dev agent "hello"
+```

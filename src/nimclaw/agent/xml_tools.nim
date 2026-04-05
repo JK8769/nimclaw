@@ -294,9 +294,16 @@ proc buildToolInstructions*(registry: tools_registry.ToolRegistry): string =
     if ok and tool != nil:
       let params = tool.parameters()
       var pNames: seq[string] = @[]
-      for k in params.keys: pNames.add(k)
+      # Extract actual parameter names from JSON Schema properties
+      if params.hasKey("properties") and params["properties"].kind == JObject:
+        for k in params["properties"].keys: pNames.add(k)
+      elif params.hasKey("type"):
+        # Already a schema wrapper — skip schema keys
+        discard
+      else:
+        for k in params.keys: pNames.add(k)
       let pStr = if pNames.len > 0: "(" & pNames.join(", ") & ")" else: ""
-      
+
       # Minimal one-line format
       sb.add("- " & tool.name() & pStr & ": " & tool.description() & "\n")
 
@@ -322,7 +329,12 @@ proc buildToolInstructionsFiltered*(registry: tools_registry.ToolRegistry, allow
       if not allowedSet.hasKey(n): continue
       let params = tool.parameters()
       var pNames: seq[string] = @[]
-      for k in params.keys: pNames.add(k)
+      if params.hasKey("properties") and params["properties"].kind == JObject:
+        for k in params["properties"].keys: pNames.add(k)
+      elif params.hasKey("type"):
+        discard
+      else:
+        for k in params.keys: pNames.add(k)
       let pStr = if pNames.len > 0: "(" & pNames.join(", ") & ")" else: ""
       sb.add("- " & tool.name() & pStr & ": " & tool.description() & "\n")
 

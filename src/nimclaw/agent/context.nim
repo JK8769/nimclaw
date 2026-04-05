@@ -99,9 +99,11 @@ $4
 
 1. **ALWAYS use tools** - When you need to perform an action (schedule reminders, send messages, execute commands, etc.), you MUST call the appropriate tool. Do NOT just say you'll do it or pretend to do it.
 
-2. **Be helpful and accurate** - When using tools, briefly explain what you're doing.
+2. **Verify before reporting** - For multi-step tasks (browser automation, file operations, API calls), VERIFY the result of each step before moving on. If something fails, report the failure clearly — never silently skip errors or assume success.
 
-3. **Memory** - When remembering something, write to $3/memory/MEMORY.md""".format(now, runtime, workspacePath, toolsSection)
+3. **Be helpful and accurate** - When using tools, briefly explain what you're doing.
+
+4. **Memory** - When remembering something, write to $3/memory/MEMORY.md""".format(now, runtime, workspacePath, toolsSection)
 
 proc buildSocialSection*(cb: ContextBuilder, userID: string, recipientID: string = "", channel: string = "social"): string =
   var sb = "# Social Context\n\n"

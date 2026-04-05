@@ -1,4 +1,4 @@
-import std/[json, tables, strutils, asyncdispatch]
+import std/[json, tables, strutils, asyncdispatch, os]
 import types
 
 when defined(linux):
@@ -84,20 +84,20 @@ when defined(linux):
 
   proc scanLinux(bus: int): string =
     let path = "/dev/i2c-" & $bus
-    let fd = open(path.cstring, O_RDWR, 0)
+    let fd = posix.open(path.cstring, O_RDWR, 0)
     if fd < 0:
       return "Error: Cannot open I2C bus (permission denied or bus not found)"
-    defer: discard close(fd)
-    
+    defer: discard posix.close(fd)
+
     var output = "{\"bus\":" & $bus & ",\"devices\":["
     var found = 0
-    
+
     for addr in I2C_ADDR_MIN..I2C_ADDR_MAX:
       let rc = ioctl(fd, I2C_SLAVE, addr)
       if rc < 0: continue
-      
+
       var dummy: array[0, uint8]
-      let wrc = write(fd, addr(dummy), 0)
+      let wrc = posix.write(fd, addr(dummy), 0)
       if wrc < 0: continue
       
       if found > 0: output &= ","
@@ -109,21 +109,21 @@ when defined(linux):
 
   proc readLinux(bus: int, address: int, reg: int, length: int): string =
     let path = "/dev/i2c-" & $bus
-    let fd = open(path.cstring, O_RDWR, 0)
+    let fd = posix.open(path.cstring, O_RDWR, 0)
     if fd < 0:
       return "Error: Cannot open I2C bus"
-    defer: discard close(fd)
-    
+    defer: discard posix.close(fd)
+
     let rc = ioctl(fd, I2C_SLAVE, cint(address))
     if rc < 0:
       return "Error: Failed to set I2C slave address"
-      
+
     var regByte = uint8(reg)
-    if write(fd, addr(regByte), 1) != 1:
+    if posix.write(fd, addr(regByte), 1) != 1:
       return "Error: Failed to write register address"
-      
+
     var readBuf = newSeq[uint8](length)
-    let n = read(fd, addr(readBuf[0]), csize_t(length))
+    let n = posix.read(fd, addr(readBuf[0]), length)
     if n < 0:
       return "Error: Failed to read from I2C device"
       
@@ -140,19 +140,19 @@ when defined(linux):
 
   proc writeLinux(bus: int, address: int, reg: int, value: int): string =
     let path = "/dev/i2c-" & $bus
-    let fd = open(path.cstring, O_RDWR, 0)
+    let fd = posix.open(path.cstring, O_RDWR, 0)
     if fd < 0:
       return "Error: Cannot open I2C bus"
-    defer: discard close(fd)
-    
+    defer: discard posix.close(fd)
+
     let rc = ioctl(fd, I2C_SLAVE, cint(address))
     if rc < 0:
       return "Error: Failed to set I2C slave address"
-      
+
     var writeBuf: array[2, uint8]
     writeBuf[0] = uint8(reg)
     writeBuf[1] = uint8(value)
-    if write(fd, addr(writeBuf[0]), 2) != 2:
+    if posix.write(fd, addr(writeBuf[0]), 2) != 2:
       return "Error: Failed to write to I2C device"
       
     return "{\"bus\":" & $bus & ",\"address\":\"0x" & toHex(address, 2) & "\",\"register\":" & $reg & ",\"value\":" & $value & ",\"status\":\"ok\"}"

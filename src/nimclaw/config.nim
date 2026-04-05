@@ -45,9 +45,6 @@ type
   FeishuAppConfig* = object
     enabled*: Option[bool]
     app_id*: string
-    app_secret*: string
-    encrypt_key*: string
-    verification_token*: string
 
   FeishuConfig* = object
     enabled*: bool
@@ -147,6 +144,10 @@ proc expandHome*(path: string): string =
 
 var cachedNimClawDir {.threadvar.}: string
 
+proc resetNimClawDir*() =
+  ## Clear the cached NimClaw directory so it's re-resolved on next call.
+  cachedNimClawDir = ""
+
 proc getNimClawDir*(): string =
   ## Returns the base directory for NimClaw. Result is cached after first call.
   ## Priority: NIMCLAW_DIR env var > local ./.nimclaw > ~/.nimclaw
@@ -175,14 +176,32 @@ proc getTemplateDir*(): string =
   # 1. Local project dir (highest priority for development)
   let local = getCurrentDir() / "templates"
   if dirExists(local): return local
-  
-  # 2. Compile-time source root (robust for Nimble installations)
-  const srcRoot = currentSourcePath().parentDir() / ".." # back from src/nimclaw/
-  const bundle = srcRoot / "templates"
-  if dirExists(bundle): return bundle
-  
-  # 3. Last resort fallback
+
+  # 2. Next to the binary (release tarballs, nimble builds)
+  let binDir = getAppDir() / "templates"
+  if dirExists(binDir): return binDir
+
+  # 3. Installed lib dir (curl|sh installs to ~/.local/lib/nimclaw/)
+  let libDir = expandHome("~/.local/lib/nimclaw/templates")
+  if dirExists(libDir): return libDir
+
+  # 4. Last resort fallback
   return getNimClawDir() / "templates"
+
+proc loadDotEnv*() =
+  ## Load .env files from CWD and NIMCLAW_DIR
+  let paths = [
+    getCurrentDir() / ".env",
+    getNimClawDir() / ".env"
+  ]
+  for envPath in paths:
+    if fileExists(envPath):
+      for line in readFile(envPath).splitLines():
+        let pair = line.split("=", 1)
+        if pair.len == 2:
+          let key = pair[0].strip()
+          let val = pair[1].strip()
+          if key.len > 0: putEnv(key, val)
 
 proc defaultConfig*(): Config =
   result = Config(

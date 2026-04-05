@@ -2,7 +2,7 @@ import std/[os, json, strutils, times, tables]
 import agent/cortex, config, jsony, cli_providers, utils
 
 
-proc seedWorkspace(tplDir, workspace: string) =
+proc seedWorkspace*(tplDir, workspace: string) =
   ## Recursively copies the workspace structure from templates
   let source = tplDir / "workspace"
   if not dirExists(source): return

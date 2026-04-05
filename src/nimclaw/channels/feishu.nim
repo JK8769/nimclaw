@@ -8,12 +8,17 @@ type
     reactionID: string
     appID: string
 
+  SubscriberArgs = object
+    channel: FeishuChannel
+    appID: string
+    larkCliBin: string
+    configDir: string
+
   FeishuAppInstance = ref object
     appID: string
-    appSecret: string
     enabled: bool
     subscribeProcess: Process
-    subscriberThread: Thread[(Process, FeishuChannel, string)]
+    subscriberThread: Thread[SubscriberArgs]
 
   FeishuChannel* = ref object of BaseChannel
     apps: seq[FeishuAppInstance]
@@ -49,7 +54,137 @@ proc displayWidth(s: string): int =
     of uwdtWide, uwdtFull: result += 2
     else: result += 1
 
-proc buildPostContent(text: string): string =
+proc parseLine(line: string): JsonNode =
+  ## Parse a single line into Feishu post elements with link and bold support.
+  var paragraph = newJArray()
+  var i = 0
+  var buf = ""
+
+  proc flushBuf(paragraph: JsonNode, buf: var string) =
+    if buf.len > 0:
+      paragraph.add(%*{"tag": "text", "text": buf})
+      buf = ""
+
+  while i < line.len:
+    # Bold: **text**
+    if i < line.len - 3 and line[i] == '*' and line[i+1] == '*':
+      flushBuf(paragraph, buf)
+      let start = i + 2
+      let endPos = line.find("**", start)
+      if endPos > start:
+        paragraph.add(%*{"tag": "text", "text": line[start..<endPos], "style": ["bold"]})
+        i = endPos + 2
+      else:
+        buf.add(line[i])
+        inc i
+    # Markdown link: [text](url)
+    elif line[i] == '[':
+      let textStart = i + 1
+      let textEnd = line.find(']', textStart)
+      if textEnd > textStart and textEnd + 1 < line.len and line[textEnd + 1] == '(':
+        let urlStart = textEnd + 2
+        let urlEnd = line.find(')', urlStart)
+        if urlEnd > urlStart:
+          flushBuf(paragraph, buf)
+          paragraph.add(%*{"tag": "a", "text": line[textStart..<textEnd], "href": line[urlStart..<urlEnd]})
+          i = urlEnd + 1
+        else:
+          buf.add(line[i])
+          inc i
+      else:
+        buf.add(line[i])
+        inc i
+    # Bare URL: https:// or http://
+    elif i < line.len - 7 and (line[i..min(i+6, line.len-1)] == "http://" or (i < line.len - 8 and line[i..min(i+7, line.len-1)] == "https://")):
+      flushBuf(paragraph, buf)
+      let urlStart = i
+      while i < line.len and line[i] notin {' ', '\n', '\r', '\t', ')', '>', ']', '"', '\''}:
+        inc i
+      let url = line[urlStart..<i]
+      var display = url
+      if display.startsWith("https://"): display = display[8..^1]
+      elif display.startsWith("http://"): display = display[7..^1]
+      paragraph.add(%*{"tag": "a", "text": display, "href": url})
+    else:
+      buf.add(line[i])
+      inc i
+
+  flushBuf(paragraph, buf)
+  return paragraph
+
+proc stripMarkdown(s: string): string =
+  ## Strip markdown formatting (bold, italic, etc.) for code block rendering
+  result = s.replace("**", "").replace("~~", "")
+
+proc padCell(s: string, w: int): string =
+  let extra = w - displayWidth(s)
+  s & ' '.repeat(max(0, extra))
+
+proc tablesToCodeBlocks*(text: string): string =
+  ## Convert markdown pipe tables to aligned code blocks for Feishu.
+  ## Feishu markdown doesn't render pipe tables, but code blocks use monospace.
+  let lines = text.split("\n")
+  var i = 0
+  var parts: seq[string]
+  while i < lines.len:
+    let line = lines[i]
+    if i + 1 < lines.len and line.contains("|") and isTableSeparatorRow(lines[i+1]):
+      # Parse full table — strip markdown first, then compute widths
+      let rawHeader = splitTableRow(line)
+      let numCols = rawHeader.len
+      var headerCells: seq[string] = @[]
+      for c in rawHeader:
+        headerCells.add(stripMarkdown(c))
+
+      var dataRows: seq[seq[string]] = @[]
+      var j = i + 2
+      while j < lines.len and lines[j].contains("|"):
+        let rawCells = splitTableRow(lines[j])
+        if rawCells.len == 0: break
+        var row: seq[string] = @[]
+        for ci in 0..<numCols:
+          let cell = if ci < rawCells.len: stripMarkdown(rawCells[ci]) else: ""
+          row.add(cell)
+        dataRows.add(row)
+        inc j
+
+      # Compute column widths from cleaned text
+      var colWidths = newSeq[int](numCols)
+      for ci, c in headerCells:
+        colWidths[ci] = max(colWidths[ci], displayWidth(c))
+      for row in dataRows:
+        for ci, c in row:
+          colWidths[ci] = max(colWidths[ci], displayWidth(c))
+
+      var table = "```\n"
+      var headerLine = ""
+      for ci, c in headerCells:
+        if ci > 0: headerLine.add("  ")
+        headerLine.add(padCell(c, colWidths[ci]))
+      table.add(headerLine & "\n")
+      var sepLine = ""
+      for ci in 0..<numCols:
+        if ci > 0: sepLine.add("  ")
+        sepLine.add('-'.repeat(colWidths[ci]))
+      table.add(sepLine & "\n")
+      for dr in dataRows:
+        var dataLine = ""
+        for ci, c in dr:
+          if ci > 0: dataLine.add("  ")
+          dataLine.add(padCell(c, colWidths[ci]))
+        table.add(dataLine & "\n")
+      table.add("```")
+      parts.add(table)
+      i = j
+    else:
+      parts.add(line)
+      inc i
+  result = parts.join("\n")
+
+proc buildPostContent*(text: string): string =
+  ## Convert text to Feishu native post JSON format.
+  ## Handles: bare URLs, markdown links [text](url), bold **text**, tables, and plain text.
+  ## URLs become clickable {"tag": "a"} elements.
   var rows: seq[JsonNode] = @[]
   let lines = text.split("\n")
 
@@ -78,10 +213,6 @@ proc buildPostContent(text: string): string =
         dataRows.add(row)
         inc j
 
-      proc padCell(s: string, w: int): string =
-        let extra = w - displayWidth(s)
-        s & ' '.repeat(max(0, extra))
-
       var tableText = ""
       var headerLine = ""
       for ci, c in headerCells:
@@ -101,12 +232,12 @@ proc buildPostContent(text: string): string =
       i = j
       continue
 
-    rows.add(%*[{"tag": "text", "text": line & "\n"}])
+    rows.add(parseLine(line))
     inc i
 
   result = $ %*{"zh_cn": {"content": rows}}
 
-proc tryExtractInteractiveCard(content: string): Option[string] =
+proc tryExtractInteractiveCard*(content: string): Option[string] =
   try:
     let j = parseJson(content)
     if j.kind != JObject: return options.none(string)
@@ -254,11 +385,27 @@ proc pruneCache(c: FeishuChannel) =
     infoCF("feishu", "Pruned message cache", {"deleted": $toDel.len}.toTable)
     c.saveCache()
 
+# --- lark-cli environment helper ---
+
+proc buildLarkEnv(configDir: string): StringTableRef =
+  result = newStringTable(modeCaseSensitive)
+  for key, val in envPairs():
+    result[key] = val
+  result["LARKSUITE_CLI_CONFIG_DIR"] = configDir
+
 # --- lark-cli bridge reader ---
 
-proc eventReader(args: (Process, FeishuChannel, string)) {.thread.} =
-  ## Reads compact NDJSON events from `lark-cli event +subscribe --compact --quiet`.
-  let (p, c, appID) = args
+proc startSubscriberProcess(larkCliBin, configDir: string): Process =
+  let env = buildLarkEnv(configDir)
+  result = startProcess(
+    larkCliBin,
+    args = ["event", "+subscribe", "--event-types", "im.message.receive_v1,card.action.trigger", "--compact", "--quiet"],
+    env = env,
+    options = {poUsePath}
+  )
+
+proc readEvents(p: Process, c: FeishuChannel, appID: string) =
+  ## Read events from a single subscriber process until it dies or channel stops.
   let s = p.outputStream()
   var line = ""
   while c.running and not s.atEnd():
@@ -268,6 +415,26 @@ proc eventReader(args: (Process, FeishuChannel, string)) {.thread.} =
 
       let evt = parseJson(line)
       let evtType = evt.getOrDefault("type").getStr()
+
+      if evtType == "card.action.trigger":
+        let action = evt.getOrDefault("action")
+        let context = evt.getOrDefault("context")
+        let operator = evt.getOrDefault("operator")
+        let chatID = context.getOrDefault("open_chat_id").getStr()
+        let messageID = context.getOrDefault("open_message_id").getStr()
+        let senderID = operator.getOrDefault("open_id").getStr()
+        let actionValue = if action.kind == JObject: $action.getOrDefault("value") else: ""
+
+        if chatID.len == 0:
+          debugCF("feishu", "Card action without chat_id, skipping", {"event_id": evt.getOrDefault("event_id").getStr()}.toTable)
+          continue
+
+        infoCF("feishu", "Card action received", {"chat": chatID, "sender": senderID, "action": actionValue}.toTable)
+
+        let content = "[Card button clicked: " & actionValue & "]"
+        var metadata = {"message_id": messageID, "app_id": appID, "event_type": "card.action.trigger", "action_value": actionValue}.toTable
+        c.handleMessage(senderID, chatID, content, @[], metadata)
+        continue
 
       if evtType != "im.message.receive_v1":
         debugCF("feishu", "Non-IM event received", {"type": evtType}.toTable)
@@ -305,40 +472,124 @@ proc eventReader(args: (Process, FeishuChannel, string)) {.thread.} =
           debugCF("feishu", "Ignoring stale message", {"msg_id": messageID, "age_s": $((nowMs - createTime) div 1000)}.toTable)
           continue
 
-      infoCF("feishu", "Processing message", {"msg_id": messageID, "sender": senderID, "chat": chatID, "type": messageType}.toTable)
+      let rootID = evt.getOrDefault("root_id").getStr()
+      let parentID = evt.getOrDefault("parent_id").getStr()
+      let threadID = evt.getOrDefault("thread_id").getStr()
+      infoCF("feishu", "Processing message", {"msg_id": messageID, "sender": senderID, "chat": chatID, "type": messageType, "root_id": rootID, "parent_id": parentID, "thread_id": threadID}.toTable)
 
       var finalContent = content
-      if messageType != "text":
+      var mediaPaths: seq[string] = @[]
+
+      if messageType == "image":
+        # Parse image_key from content JSON: {"image_key":"img_v3_xxx"}
+        var imageKey = ""
+        try:
+          let contentJson = parseJson(content)
+          imageKey = contentJson{"image_key"}.getStr("")
+        except: discard
+
+        if imageKey.len > 0 and messageID.len > 0:
+          let mediaDir = getNimClawDir() / "channels" / "feishu" / "lark-cli-" & appID / "cache" / "media"
+          try:
+            createDir(mediaDir)
+            let outputPath = mediaDir / imageKey & ".jpg"
+            let configDir = getNimClawDir() / "channels" / "feishu" / "lark-cli-" & appID
+            let env = buildLarkEnv(configDir)
+            let dlProc = startProcess(c.larkCliBin,
+              args = ["im", "+messages-resources-download",
+                      "--message-id", messageID,
+                      "--file-key", imageKey,
+                      "--type", "image",
+                      "--output", outputPath],
+              env = env, options = {poUsePath})
+            let code = dlProc.waitForExit(30000)
+            dlProc.close()
+            if code == 0 and fileExists(outputPath):
+              mediaPaths.add(outputPath)
+              finalContent = "[image: " & outputPath & "]"
+              infoCF("feishu", "Downloaded image", {"file_key": imageKey, "path": outputPath}.toTable)
+            else:
+              finalContent = "[image: download failed for " & imageKey & "]"
+              warnCF("feishu", "Image download failed", {"file_key": imageKey, "exit_code": $code}.toTable)
+          except Exception as e:
+            finalContent = "[image: download error: " & e.msg & "]"
+            errorCF("feishu", "Image download error", {"file_key": imageKey, "error": e.msg}.toTable)
+        else:
+          finalContent = "[image: missing image_key or message_id]"
+
+      elif messageType == "audio":
+        finalContent = "[audio: " & messageID & "]"
+      elif messageType == "file":
+        finalContent = "[file: " & messageID & "]"
+      elif messageType != "text":
         finalContent = "[Non-text message: " & messageType & "]"
 
       var metadata = {"message_id": messageID, "app_id": appID}.toTable
-      let threadID = evt.getOrDefault("thread_id").getStr()
+      if rootID.len > 0:
+        metadata["root_id"] = rootID
+      if parentID.len > 0:
+        metadata["parent_id"] = parentID
       if threadID.len > 0:
         metadata["thread_id"] = threadID
 
-      c.handleMessage(senderID, chatID, finalContent, @[], metadata)
+      c.handleMessage(senderID, chatID, finalContent, mediaPaths, metadata)
     except Exception as e:
       errorCF("feishu", "Event parse error", {"error": e.msg}.toTable)
-  c.running = false
+
+proc eventReader(args: SubscriberArgs) {.thread.} =
+  ## Reads events from lark-cli subscriber. Auto-restarts on crash with backoff.
+  let c = args.channel
+  let appID = args.appID
+  var backoff = 1  # seconds
+
+  while c.running:
+    var p: Process
+    try:
+      p = startSubscriberProcess(args.larkCliBin, args.configDir)
+    except Exception as e:
+      errorCF("feishu", "Failed to start subscriber", {"app_id": appID, "error": e.msg}.toTable)
+      if not c.running: break
+      sleep(backoff * 1000)
+      backoff = min(backoff * 2, 30)
+      continue
+
+    # Update the app's process reference for clean shutdown
+    for app in c.apps:
+      if app.appID == appID:
+        app.subscribeProcess = p
+        break
+
+    infoCF("feishu", "Subscriber connected", {"app_id": appID}.toTable)
+    backoff = 1  # reset on successful connect
+
+    readEvents(p, c, appID)
+
+    # Process ended — clean up
+    let exitCode = try: p.waitForExit(100) except: -1
+    try: p.close() except: discard
+
+    if not c.running: break
+    warnCF("feishu", "Subscriber died, restarting", {"app_id": appID, "exit_code": $exitCode, "backoff_s": $backoff}.toTable)
+    sleep(backoff * 1000)
+    backoff = min(backoff * 2, 30)
 
 # --- lark-cli binary discovery ---
 
-proc findLarkCli(): string =
+proc findLarkCli*(): string =
   # Check thirdparty build, then PATH
-  let thirdparty = currentSourcePath().parentDir().parentDir().parentDir().parentDir() / "thridparty" / "cli" / "lark-cli"
+  let thirdparty = currentSourcePath().parentDir().parentDir().parentDir().parentDir() / "channels" / "bin" / "lark-cli"
   if fileExists(thirdparty): return thirdparty
   let onPath = findExe("lark-cli")
   if onPath.len > 0: return onPath
   return ""
 
-proc initLarkCliConfig(bin, appID, appSecret: string) =
+proc initLarkCliConfig*(bin, appID, appSecret: string): bool =
   ## Initialize lark-cli config non-interactively for an app.
   let configDir = getNimClawDir() / "channels" / "feishu" / "lark-cli-" & appID
   try:
     createDir(configDir)
   except: discard
-  let env = newStringTable(modeCaseSensitive)
-  env["LARKSUITE_CLI_CONFIG_DIR"] = configDir
+  let env = buildLarkEnv(configDir)
   try:
     let p = startProcess(bin, args = ["config", "init", "--app-id", appID, "--app-secret-stdin", "--brand", "feishu"],
                          env = env, options = {poUsePath})
@@ -348,6 +599,7 @@ proc initLarkCliConfig(bin, appID, appSecret: string) =
     p.close()
     if code == 0:
       infoCF("feishu", "lark-cli config initialized", {"app_id": appID}.toTable)
+      return true
     else:
       errorCF("feishu", "lark-cli config init failed", {"app_id": appID, "code": $code}.toTable)
   except Exception as e:
@@ -370,7 +622,6 @@ proc newFeishuChannel*(cfg: FeishuConfig, bus: MessageBus): FeishuChannel =
   for appCfg in cfg.apps:
     result.apps.add(FeishuAppInstance(
       appID: appCfg.app_id,
-      appSecret: appCfg.app_secret,
       enabled: (if options.isSome(appCfg.enabled): options.get(appCfg.enabled) else: true)
     ))
   initLock(result.cacheLock)
@@ -386,7 +637,7 @@ method start*(c: FeishuChannel) {.async.} =
     return
 
   if c.larkCliBin.len == 0:
-    errorC("feishu", "lark-cli binary not found. Build with: cd thridparty/cli && make build")
+    errorC("feishu", "lark-cli binary not found. Build with: nimble build_lark")
     return
 
   infoC("feishu", "Starting Feishu channel via lark-cli...")
@@ -397,22 +648,26 @@ method start*(c: FeishuChannel) {.async.} =
       infoCF("feishu", "Feishu app disabled", {"app_id": app.appID}.toTable)
       continue
 
-    # Ensure lark-cli config exists for this app
+    # lark-cli config must exist (created by: nimclaw channel add feishu)
     let configDir = getNimClawDir() / "channels" / "feishu" / "lark-cli-" & app.appID
-    if not fileExists(configDir / "config.yaml"):
-      initLarkCliConfig(c.larkCliBin, app.appID, app.appSecret)
+    if not fileExists(configDir / "config.json"):
+      errorCF("feishu", "lark-cli not configured for app. Run: nimclaw channel add feishu <APP_ID> <APP_SECRET>", {"app_id": app.appID}.toTable)
+      continue
 
-    let env = newStringTable(modeCaseSensitive)
-    env["LARKSUITE_CLI_CONFIG_DIR"] = configDir
+    # Clear stale lock files from previous unclean shutdown
+    let locksDir = configDir / "locks"
+    try:
+      for f in walkDir(locksDir, relative = true):
+        if f.path.endsWith(".lock"):
+          try:
+            removeFile(locksDir / f.path)
+            infoCF("feishu", "Cleared stale lock", {"file": f.path}.toTable)
+          except: discard
+    except OSError: discard
 
     infoCF("feishu", "Starting lark-cli event subscriber", {"app_id": app.appID}.toTable)
-    app.subscribeProcess = startProcess(
-      c.larkCliBin,
-      args = ["event", "+subscribe", "--event-types", "im.message.receive_v1", "--compact", "--quiet"],
-      env = env,
-      options = {poUsePath}
-    )
-    createThread(app.subscriberThread, eventReader, (app.subscribeProcess, c, app.appID))
+    let subArgs = SubscriberArgs(channel: c, appID: app.appID, larkCliBin: c.larkCliBin, configDir: configDir)
+    createThread(app.subscriberThread, eventReader, subArgs)
 
   infoC("feishu", "Feishu event subscribers started")
 
@@ -457,8 +712,7 @@ method send*(c: FeishuChannel, msg: OutboundMessage) {.async.} =
   if app.isNil: return
 
   let configDir = getNimClawDir() / "channels" / "feishu" / "lark-cli-" & app.appID
-  let env = newStringTable(modeCaseSensitive)
-  env["LARKSUITE_CLI_CONFIG_DIR"] = configDir
+  let env = buildLarkEnv(configDir)
 
   # Handle typing indicator (reaction-based) via REST API since lark-cli doesn't have a reaction shortcut
   if msg.kind == Typing:
@@ -500,33 +754,39 @@ method send*(c: FeishuChannel, msg: OutboundMessage) {.async.} =
 
   # Build send/reply command
   let cardOpt = tryExtractInteractiveCard(msg.content)
+  let format = msg.metadata.getOrDefault("format", "")
+  let imageVal = msg.metadata.getOrDefault("image", "")
+  let fileVal = msg.metadata.getOrDefault("file", "")
+  let replyInThread = msg.metadata.getOrDefault("reply_in_thread", "") == "true"
   var args: seq[string] = @[]
 
   if replyID.len > 0:
     args = @["im", "+messages-reply", "--message-id", replyID]
-    if options.isSome(cardOpt):
-      args.add("--msg-type")
-      args.add("interactive")
-      args.add("--content")
-      args.add(options.get(cardOpt))
-    else:
-      args.add("--msg-type")
-      args.add("post")
-      args.add("--content")
-      args.add(buildPostContent(msg.content))
+    if replyInThread:
+      args.add("--reply-in-thread")
   else:
     let idType = if msg.chat_id.startsWith("ou_"): "--user-id" else: "--chat-id"
     args = @["im", "+messages-send", idType, msg.chat_id]
-    if options.isSome(cardOpt):
-      args.add("--msg-type")
-      args.add("interactive")
-      args.add("--content")
-      args.add(options.get(cardOpt))
-    else:
-      args.add("--msg-type")
-      args.add("post")
-      args.add("--content")
-      args.add(buildPostContent(msg.content))
+
+  # Choose content format: image > file > card > markdown > post
+  if imageVal.len > 0:
+    args.add("--image")
+    args.add(imageVal)
+    if msg.content.len > 0:
+      # Send text as a separate follow-up (lark-cli image doesn't support caption)
+      discard
+  elif fileVal.len > 0:
+    args.add("--file")
+    args.add(fileVal)
+  elif options.isSome(cardOpt):
+    args.add("--msg-type")
+    args.add("interactive")
+    args.add("--content")
+    args.add(options.get(cardOpt))
+  else:
+    # tablesToCodeBlocks is a no-op when there are no pipe tables
+    args.add("--markdown")
+    args.add(tablesToCodeBlocks(msg.content))
 
   args.add("--as")
   args.add("bot")

@@ -140,7 +140,7 @@ method chat*(p: HTTPProvider, messages: seq[Message], tools: seq[ToolDefinition]
   
   debugCF("http_provider", "Full request body", {"json": $requestBody}.toTable)
 
-  proc doRequest(c: Curly, url, body: string, headers: HttpHeaders, timeout: int): tuple[code: int, body: string] =
+  proc doRequest(c: Curly, url, body: string, headers: HttpHeaders, timeout: int): tuple[code: int, body: string] {.gcsafe.} =
     curlyPostWithRetry(c, url, body, headers, timeout)
 
   # Instrumentation for opencode_go debugging
@@ -161,7 +161,19 @@ method chat*(p: HTTPProvider, messages: seq[Message], tools: seq[ToolDefinition]
   while not fv.isReady:
     await sleepAsync(10)
     
-  let (code, body) = fv.sync()
+  var (code, body) = fv.sync()
+
+  # Retry on 429/529 rate limiting with exponential backoff
+  if code in [429, 529]:
+    for retryAttempt in 1..5:
+      let delay = retryAttempt * retryAttempt * 2  # 2s, 8s, 18s, 32s, 50s
+      warnCF("http_provider", "Rate limited (" & $code & "), retrying", {"attempt": $retryAttempt, "delay_s": $delay}.toTable)
+      await sleepAsync(delay * 1000)
+      let retryFv = p.master.spawn doRequest(p.curly, url, $requestBody, headers, p.timeout)
+      while not retryFv.isReady:
+        await sleepAsync(10)
+      (code, body) = retryFv.sync()
+      if code notin [429, 529]: break
 
   if code == -1:
     raise newException(IOError, "Curly request failed: " & body)
@@ -183,20 +195,49 @@ method chat*(p: HTTPProvider, messages: seq[Message], tools: seq[ToolDefinition]
 
     if msg.hasKey("tool_calls"):
       for tc in msg["tool_calls"]:
+        infoCF("http_provider", "Raw tool_call from LLM", {"raw": $tc}.toTable)
         var toolCall = ToolCall(
           id: tc["id"].getStr(),
           `type`: tc.getOrDefault("type").getStr("function")
         )
         if tc.hasKey("function"):
           let fn = tc["function"]
-          toolCall.name = fn["name"].getStr()
+          var rawName = fn["name"].getStr()
           let argsStr = fn["arguments"].getStr()
+
+          # Fix malformed calls from LLMs that put args in the name field
+          # Pattern 1: "playwright(action=\"click\", target=\"e81\")" → name + args
+          let parenPos = rawName.find('(')
+          if parenPos > 0 and rawName.endsWith(")"):
+            let inlineArgs = rawName[parenPos + 1 .. ^2]  # strip parens
+            rawName = rawName[0 ..< parenPos]
+            for part in inlineArgs.split(","):
+              let kv = part.strip().split("=", maxsplit = 1)
+              if kv.len == 2:
+                let k = kv[0].strip()
+                var v = kv[1].strip()
+                if v.len >= 2 and v[0] == '"' and v[^1] == '"':
+                  v = v[1..^2]
+                toolCall.arguments[k] = %v
+            warnCF("http_provider", "Fixed malformed tool call name (parens)", {"original": fn["name"].getStr(), "fixed_name": rawName}.toTable)
+
+          # Pattern 2: "playwright snapshot" → name="playwright", command="snapshot"
+          elif ' ' in rawName:
+            let spacePos = rawName.find(' ')
+            let extra = rawName[spacePos + 1 .. ^1].strip()
+            rawName = rawName[0 ..< spacePos]
+            if extra.len > 0:
+              toolCall.arguments["command"] = %extra
+            warnCF("http_provider", "Fixed malformed tool call name (space)", {"original": fn["name"].getStr(), "fixed_name": rawName, "extracted_command": extra}.toTable)
+
+          toolCall.name = rawName
           try:
             let argsJson = parseJson(argsStr)
             for k, v in argsJson.fields:
               toolCall.arguments[k] = v
           except:
-            toolCall.arguments["raw"] = %argsStr
+            if argsStr.len > 0 and argsStr != "{}":
+              toolCall.arguments["raw"] = %argsStr
         llmResp.tool_calls.add(toolCall)
 
     llmResp.finish_reason = choice.getOrDefault("finish_reason").getStr("stop")

@@ -1,0 +1,51 @@
+[
+  {
+    "name": "anygen",
+    "description": "AI-powered content creation suite: slides, documents, diagrams, websites, data visualizations, reports, and more",
+    "repository": "https://github.com/AnyGenIO/anygen-suite-skill",
+    "sub_path": "anygen-suite",
+    "source": "bundled",
+    "requires": ["python3", "node"],
+    "env": ["ANYGEN_API_KEY"],
+    "plugins": ["playwright-cli"],
+    "install": [
+      "pip3 install requests",
+      "npm install -g tsx"
+    ],
+    "configure": "python3 {skill_dir}/scripts/anygen.py config set api_key \"{ANYGEN_API_KEY}\""
+  },
+  {
+    "name": "nimclaw-web-search",
+    "description": "Web search using NimClaw's built-in web_search tool",
+    "source": "bundled"
+  },
+  {
+    "name": "nimclaw-web-fetch",
+    "description": "Fetch and extract web page content using NimClaw's built-in web_fetch tool",
+    "source": "bundled"
+  },
+  {
+    "name": "nimclaw-doc-parse",
+    "description": "Parse documents (PDF, Word, Excel, PPT) via AnyGen upload or local CLI tools",
+    "source": "bundled",
+    "requires": ["python3"],
+    "skills": ["anygen"]
+  },
+  {
+    "name": "nimclaw-image-understanding",
+    "description": "Analyze and describe images using vision-capable LLM or Ollama multimodal model",
+    "source": "bundled"
+  },
+  {
+    "name": "nimclaw-text-gen-image",
+    "description": "Generate images from text descriptions via AnyGen ai_designer operation",
+    "source": "bundled",
+    "requires": ["python3"],
+    "skills": ["anygen"]
+  },
+  {
+    "name": "nimclaw-speech-to-text",
+    "description": "Convert audio to text via Groq Whisper API or Ollama",
+    "source": "bundled"
+  }
+]

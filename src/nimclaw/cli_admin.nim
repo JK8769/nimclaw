@@ -1,6 +1,7 @@
 import std/[os, strutils, strformat, osproc, json, options, times, tables, asyncdispatch]
-import config, agent/invites, agent/cortex, libnkn/nknWallet, QRgen, utils
+import config, agent/invites, agent/cortex, libnkn/nkn_bridge, QRgen, utils
 import skills/[loader as skills_loader, installer as skills_installer]
+import channels/feishu as feishu_channel
 
 ## All administrative CLI subcommands ported from nullclaw.
 
@@ -113,6 +114,65 @@ proc runModelsCommand*(cfg: Config, args: seq[string]): string =
     if args.len < 2: return "Usage: nimclaw models info <model>"
     let model = args[1]
     return "Model: " & model & "\n  Context: varies by provider\n  Pricing: see provider dashboard"
+  if subcmd == "use":
+    if args.len < 2: return "Usage: nimclaw models use <provider/model>\n\nExamples:\n  nimclaw models use deepseek/deepseek-chat\n  nimclaw models use opencode/kimi-k2.5\n  nimclaw models use nvidia/moonshotai/kimi-k2.5"
+    let modelStr = args[1]
+
+    # Parse provider:model or provider/model
+    # Format: "provider:model" or "provider/model" where model may contain slashes
+    # e.g. "deepseek:deepseek-chat", "nvidia:moonshotai/kimi-k2.5", "opencode:opencode/kimi-k2.5"
+    # For convenience, "deepseek/deepseek-chat" also works (first segment = provider)
+    var providerKey, modelName: string
+    let colonPos = modelStr.find(':')
+    if colonPos > 0:
+      providerKey = modelStr[0..<colonPos]
+      modelName = modelStr[colonPos+1..^1]
+    else:
+      let slashPos = modelStr.find('/')
+      if slashPos < 0:
+        providerKey = cfg.default_provider
+        modelName = modelStr
+      else:
+        providerKey = modelStr[0..<slashPos]
+        modelName = modelStr[slashPos+1..^1]
+
+    # Update BASE.json
+    let graphFile = getConfigPath().parentDir() / "BASE.json"
+    if not fileExists(graphFile):
+      return "Error: BASE.json not found at " & graphFile
+    var base = parseFile(graphFile)
+
+    # Update config defaults
+    base["config"]["default_provider"] = %providerKey
+    base["config"]["default_model"] = %modelName
+    base["config"]["agents"]["defaults"]["model"] = %modelName
+
+    # Update named agents
+    if base["config"]["agents"].hasKey("named"):
+      for i in 0..<base["config"]["agents"]["named"].len:
+        base["config"]["agents"]["named"][i]["provider"] = %providerKey
+        base["config"]["agents"]["named"][i]["model"] = %modelName
+
+    writeFile(graphFile, base.pretty(4))
+
+    var msg = "Switched to: " & providerKey & "/" & modelName & "\n"
+
+    # Kill running gateway and restart
+    let pidFile = getNimClawDir() / "gateway.pid"
+    if fileExists(pidFile):
+      let pidStr = readFile(pidFile).strip()
+      try:
+        let pid = parseInt(pidStr)
+        discard execCmd("kill " & $pid & " 2>/dev/null")
+        msg.add("Gateway (PID " & $pid & ") stopped.\n")
+        msg.add("Run `nimclaw gateway` to restart with new model.")
+      except:
+        msg.add("Could not stop gateway. Restart manually.")
+    else:
+      msg.add("No running gateway found. Run `nimclaw gateway` to start.")
+
+    return msg
+
   if subcmd == "benchmark":
     return "Running model latency benchmark...\nConfigure a provider first (nimclaw onboard)."
   if subcmd == "refresh":
@@ -138,9 +198,140 @@ proc runAuthCommand*(args: seq[string]): string =
 
 # ── channel ───────────────────────────────────────────────────────
 
-const knownChannels* = ["telegram", "discord", "whatsapp", "dingtalk", "maixcam", "feishu", "qq"]
+const knownChannels* = ["telegram", "discord", "whatsapp", "dingtalk", "maixcam", "feishu", "qq", "nmobile"]
 
-proc runChannelCommand*(cfg: Config, args: seq[string]): string =
+proc addFeishuChannel(cfg: var Config, args: seq[string]): string =
+  ## Setup a Feishu/Lark channel app.
+  ## Usage: nimclaw channel add feishu <APP_ID> <APP_SECRET>
+  let bin = feishu_channel.findLarkCli()
+  if bin.len == 0:
+    return "Error: lark-cli binary not found.\nBuild it with: nimble build_lark\nOr place it on your PATH."
+
+  if args.len < 2:
+    return "Usage: nimclaw channel add feishu <APP_ID> <APP_SECRET>\n\n" &
+           "Get your credentials from the Feishu Developer Console:\n" &
+           "  https://open.feishu.cn/app"
+
+  let appID = args[0]
+  let appSecret = args[1]
+
+  # Check if this app is already configured
+  for app in cfg.channels.feishu.apps:
+    if app.app_id == appID:
+      return "App " & appID & " is already configured."
+
+  stdout.write "Testing credentials... "
+  stdout.flushFile()
+  let ok = feishu_channel.initLarkCliConfig(bin, appID, appSecret)
+  if not ok:
+    return "Failed to configure lark-cli. Check your App ID and App Secret."
+  echo "OK"
+
+  # Add to config (secret stays only in lark-cli's config dir)
+  cfg.channels.feishu.enabled = true
+  cfg.channels.feishu.apps.add(FeishuAppConfig(
+    enabled: some(true),
+    app_id: appID,
+  ))
+
+  let configPath = getNimClawDir() / "config.json"
+  saveConfig(configPath, cfg)
+
+  return "Feishu app " & appID & " added and enabled.\nRestart the gateway to connect."
+
+proc addNMobileChannel(cfg: var Config, args: seq[string]): string =
+  ## Setup an nMobile/NKN channel.
+  ## Usage: nimclaw channel add nmobile [wallet.json path]
+  ##   If no wallet path given, generates a new wallet.
+
+  # Start nkn-cli bridge for wallet operations
+  let bridge = newNknBridge(proc(c, s, d: string) = discard)
+  defer: bridge.stop()
+
+  var walletJson = ""
+  var password = ""
+
+  if args.len > 0 and fileExists(args[0]):
+    # Import existing wallet
+    walletJson = readFile(args[0])
+    echo "Imported wallet from: ", args[0]
+    stdout.write "Wallet password: "
+    password = readMaskedInput("")
+  elif cfg.channels.nmobile.wallet_json.len > 0 and cfg.channels.nmobile.wallet_json.startsWith("{"):
+    # Already configured in BASE.json
+    walletJson = cfg.channels.nmobile.wallet_json
+    password = expandEnv(cfg.channels.nmobile.password)
+    echo "Using existing wallet from config."
+  else:
+    # Generate new wallet
+    echo "No wallet found. Generating a new NKN wallet..."
+    stdout.write "Set wallet password: "
+    password = readMaskedInput("")
+    if password.len == 0:
+      return "Cancelled. Password is required."
+    let (wJson, wErr) = bridge.getWallet(password)
+    if wErr.len > 0:
+      return "Error generating wallet: " & wErr
+    walletJson = wJson
+    echo "Wallet generated."
+
+  # Resolve address
+  let identifier = if cfg.channels.nmobile.identifier.len > 0: cfg.channels.nmobile.identifier else: "Master"
+  let (nknAddr, addrErr) = bridge.getNKNAddress(walletJson, password, identifier)
+  if addrErr.len > 0:
+    return "Error resolving NKN address: " & addrErr & "\nCheck your wallet password."
+
+  echo "NKN Address: ", nknAddr
+
+  # Create channel directory: .nimclaw/channels/nmobile/<address>/
+  let nmobileDir = getNimClawDir() / "channels" / "nmobile"
+  let addrDir = nmobileDir / nknAddr
+  createDir(addrDir)
+
+  # Save wallet to address dir
+  let walletPath = addrDir / "wallet.json"
+  writeFile(walletPath, walletJson)
+  echo "Wallet saved to: ", walletPath
+
+  # Create default extension dir
+  let extDir = addrDir / identifier
+  createDir(extDir / "cache" / "media")
+
+  # Store password in .env
+  let envFile = getNimClawDir() / ".env"
+  var envLines: seq[string] = @[]
+  if fileExists(envFile):
+    for line in readFile(envFile).splitLines():
+      if not line.startsWith("NKN_WALLET_PASSWORD="):
+        if line.strip().len > 0: envLines.add(line)
+  envLines.add("NKN_WALLET_PASSWORD=" & password)
+  writeFile(envFile, envLines.join("\n") & "\n")
+  echo "Password stored in .env as NKN_WALLET_PASSWORD"
+
+  # Update config
+  cfg.channels.nmobile.enabled = true
+  cfg.channels.nmobile.wallet_json = walletJson
+  cfg.channels.nmobile.password = "${NKN_WALLET_PASSWORD}"
+  cfg.channels.nmobile.identifier = identifier
+
+  # Save to graph (BASE.json) — update the nmobile section
+  let graphFile = getConfigPath()
+  if fileExists(graphFile):
+    var base = parseFile(graphFile)
+    if base.hasKey("config") and base["config"].hasKey("channels"):
+      base["config"]["channels"]["nmobile"]["enabled"] = %true
+      base["config"]["channels"]["nmobile"]["wallet_json"] = %walletJson
+      base["config"]["channels"]["nmobile"]["password"] = %"${NKN_WALLET_PASSWORD}"
+      base["config"]["channels"]["nmobile"]["identifier"] = %identifier
+      writeFile(graphFile, base.pretty(2))
+
+  return "nMobile channel enabled.\n" &
+         "  Address: " & nknAddr & "\n" &
+         "  Identifier: " & identifier & "\n" &
+         "  Wallet: " & walletPath & "\n" &
+         "Restart the gateway to connect."
+
+proc runChannelCommand*(cfg: var Config, args: seq[string]): string =
   if args.len == 0:
     return "Usage: nimclaw channel <list|status|add|remove> [args]"
   let subcmd = args[0]
@@ -150,13 +341,32 @@ proc runChannelCommand*(cfg: Config, args: seq[string]): string =
       res.add("  " & ch & ": available\n")
     return res
   if subcmd == "status":
-    var res = "Channel health:\n  CLI: ok\n"
-    for ch in knownChannels:
-      res.add("  " & ch & ": configured (use `channel start` to verify)\n")
+    var res = "Channel status:\n"
+    if cfg.channels.feishu.enabled and cfg.channels.feishu.apps.len > 0:
+      res.add("  feishu: enabled (" & $cfg.channels.feishu.apps.len & " app(s))\n")
+    else:
+      res.add("  feishu: disabled\n")
+    if cfg.channels.telegram.enabled: res.add("  telegram: enabled\n")
+    else: res.add("  telegram: disabled\n")
+    if cfg.channels.discord.enabled: res.add("  discord: enabled\n")
+    else: res.add("  discord: disabled\n")
+    if cfg.channels.nmobile.enabled: res.add("  nmobile: enabled\n")
+    else: res.add("  nmobile: disabled\n")
+    if cfg.channels.whatsapp.enabled: res.add("  whatsapp: enabled\n")
+    else: res.add("  whatsapp: disabled\n")
+    if cfg.channels.qq.enabled: res.add("  qq: disabled\n")
+    else: res.add("  qq: disabled\n")
+    if cfg.channels.dingtalk.enabled: res.add("  dingtalk: enabled\n")
+    else: res.add("  dingtalk: disabled\n")
+    if cfg.channels.maixcam.enabled: res.add("  maixcam: enabled\n")
+    else: res.add("  maixcam: disabled\n")
     return res
   if subcmd == "add":
-    if args.len < 2: return "Usage: nimclaw channel add <type>\nTypes: " & knownChannels.join(", ")
-    return "To add a '" & args[1] & "' channel, edit your config file."
+    if args.len < 2: return "Usage: nimclaw channel add <type>\nSupported: feishu, nmobile"
+    case args[1]
+    of "feishu", "lark": return addFeishuChannel(cfg, args[2..^1])
+    of "nmobile", "nkn": return addNMobileChannel(cfg, args[2..^1])
+    else: return "Setup not yet available for '" & args[1] & "'.\nEdit your config file directly."
   if subcmd == "remove":
     if args.len < 2: return "Usage: nimclaw channel remove <name>"
     return "To remove the '" & args[1] & "' channel, edit your config file."
@@ -200,9 +410,10 @@ proc runMigrateCommand*(cfg: Config, args: seq[string]): string =
 
 # ── service ───────────────────────────────────────────────────────
 
-proc runServiceCommand*(cfg: Config, args: seq[string]): string =
+proc runDaemonCommand*(cfg: Config, name: string, args: seq[string]): string =
+  ## Install/manage nimclaw as a system daemon (launchd/systemd)
   if args.len == 0:
-    return "Usage: nimclaw service <install|start|stop|restart|status|uninstall>"
+    return "Usage: nimclaw service deploy [Name] <install|start|stop|restart|status|uninstall>"
   let subcmd = args[0]
   let validCmds = ["install", "start", "stop", "restart", "status", "uninstall"]
   var found = false
@@ -216,7 +427,7 @@ proc runServiceCommand*(cfg: Config, args: seq[string]): string =
       return "systemctl is not available; Linux service commands require systemd."
     return "Service command '" & subcmd & "' dispatched to systemd."
   elif defined(macosx):
-    let plistName = "com.nimclaw.gateway"
+    let plistName = if name == "": "com.nimclaw.default" else: "com.nimclaw." & name
     let plistFile = expandTilde("~/Library/LaunchAgents") / (plistName & ".plist")
     
     if subcmd == "install":
@@ -241,7 +452,9 @@ proc runServiceCommand*(cfg: Config, args: seq[string]): string =
     <key>ProgramArguments</key>
     <array>
         <string>""" & absExePath & """</string>
-        <string>gateway</string>
+        <string>service</string>
+        <string>run</string>""" & (if name != "": """
+        <string>""" & name & """</string>""" else: "") & """
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -736,7 +949,14 @@ proc runAgentsCommand*(cfg: var Config, args: seq[string]): string =
     if agentConfig.nkn_identifier.isSome:
       identifier = agentConfig.nkn_identifier.get()
       
-    let (addrNkn, err) = getNKNAddress(cfg.channels.nmobile.wallet_json, cfg.channels.nmobile.password, identifier)
+    var addrNkn = ""
+    var err = ""
+    try:
+      let bridge = newNknBridge()
+      (addrNkn, err) = bridge.getNKNAddress(cfg.channels.nmobile.wallet_json, cfg.channels.nmobile.password, identifier)
+      bridge.stop()
+    except:
+      err = getCurrentExceptionMsg()
     if err == "":
       cardContent &= "### NMobile Direct Line\n"
       cardContent &= "Address: `" & addrNkn & "`\n\n"
@@ -1022,32 +1242,19 @@ Options:
     elif a == "--search": search = true
 
   if install != "":
-    let tplFile = getTemplateDir() / "skills" / install & ".json"
-    var finalRepo = install
-    if fileExists(tplFile):
-      try:
-        let tData = parseFile(tplFile)
-        finalRepo = tData{"gitUrl"}.getStr(install)
-        let apiKeyVar = tData{"apiKey"}.getStr("")
-        if apiKeyVar.startsWith("${") and apiKeyVar.endsWith("}"):
-          let envVar = apiKeyVar[2..^2]
-          if getEnv(envVar) == "":
-            echo "🔑 Skill '$1' requires an API key ($2)".format(install, envVar)
-            let val = readMaskedInput(": ")
-            if val != "":
-              let envFile = getNimClawDir() / ".env"
-              let line = "\n" & envVar & "=" & val & "\n"
-              var f: File
-              if open(f, envFile, fmAppend):
-                f.write(line)
-                f.close()
-                putEnv(envVar, val)
-                echo "✅ Saved to .env"
-      except:
-        echo "⚠️ Error reading skill template: ", getCurrentExceptionMsg()
+    # Collect env vars interactively if needed (CLI only)
+    var envVars: seq[(string, string)]
+    let regOpt = skills_installer.findInRegistry(install)
+    if regOpt.isSome:
+      let entry = regOpt.get()
+      for envVar in entry.env:
+        if getEnv(envVar) == "":
+          echo "Skill '$1' requires $2".format(install, envVar)
+          let val = readMaskedInput(": ")
+          if val.len > 0:
+            envVars.add((envVar, val))
 
-    waitFor installer.installFromGitHub(finalRepo)
-    return "Successfully installed skill: " & install
+    return waitFor installer.installByName(install, envVars)
 
   if remove != "":
     installer.uninstall(remove)

@@ -1,4 +1,4 @@
-import std/[asyncdispatch, json, tables, strutils]
+import std/[asyncdispatch, json, tables, strutils, options]
 import types
 import ../skills/installer
 
@@ -12,43 +12,67 @@ proc newSkillInstallTool*(installer: SkillInstaller): SkillInstallTool =
 method name*(t: SkillInstallTool): string = "install_skill"
 
 method description*(t: SkillInstallTool): string =
-  "Download and install a skill from a URL (e.g., GitHub or personal site). Provide a full URL or 'owner/repo' shorthand for GitHub."
+  "Install a skill by name (from skills.json registry or bundled), by GitHub URL, or by 'owner/repo' shorthand. " &
+  "If the skill requires environment variables (e.g. API keys), provide them in the env_vars parameter."
 
 method parameters*(t: SkillInstallTool): Table[string, JsonNode] =
   {
     "type": %"object",
     "properties": %*{
-      "repository": {
+      "name": {
         "type": "string",
-        "description": "The URL or 'owner/repo' shorthand of the skill to install."
+        "description": "Skill name (e.g. 'anygen', 'nimclaw-web-search') or GitHub URL/shorthand (e.g. 'AnyGenIO/anygen-suite-skill')."
+      },
+      "env_vars": {
+        "type": "object",
+        "description": "Environment variables required by the skill (e.g. {\"ANYGEN_API_KEY\": \"sk-xxx\"}). These are stored in the service .env file.",
+        "additionalProperties": {"type": "string"}
       },
       "acquisition_method": {
         "type": "string",
         "enum": ["auto", "git", "download"],
-        "description": "Optional: Explicitly choose how to fetch the skill. 'git' clones the repo, 'download' fetches a single file (SKILL.md). Defaults to 'auto'.",
+        "description": "Optional: how to fetch the skill. Defaults to 'auto' (tries bundled, then git, then download).",
         "default": "auto"
       },
       "sub_path": {
         "type": "string",
-        "description": "Optional: A specific subdirectory or file within the repository to install as the skill (e.g., 'skills/frontend-design')."
+        "description": "Optional: subdirectory within the repository to install as the skill."
       }
     },
-    "required": %["repository"]
+    "required": %["name"]
   }.toTable
 
 method execute*(t: SkillInstallTool, args: Table[string, JsonNode]): Future[string] {.async.} =
-  if not args.hasKey("repository"):
-    return "Error: Missing 'repository' parameter."
+  let nameKey = if args.hasKey("name"): "name" else: "repository"  # backward compat
+  if not args.hasKey(nameKey):
+    return "Error: Missing 'name' parameter."
 
-  let repo = args["repository"].getStr().strip()
-  if repo.len == 0:
-    return "Error: Repository path cannot be empty."
-    
-  let mode = if args.hasKey("acquisition_method"): args["acquisition_method"].getStr() else: "auto"
-  let subPath = if args.hasKey("sub_path"): args["sub_path"].getStr() else: ""
+  let name = args[nameKey].getStr().strip()
+  if name.len == 0:
+    return "Error: Skill name cannot be empty."
+
+  # Collect env vars from args
+  var envVars: seq[(string, string)]
+  if args.hasKey("env_vars"):
+    let envObj = args["env_vars"]
+    if envObj.kind == JObject:
+      for k, v in envObj.pairs:
+        envVars.add((k, v.getStr()))
 
   try:
-    await t.installer.installFromGitHub(repo, mode, subPath)
-    return "Successfully installed skill from: " & repo & " (mode: " & mode & ", sub_path: " & subPath & ")"
+    # Check if this looks like a registry name or a URL/shorthand
+    let regOpt = findInRegistry(name)
+    if regOpt.isSome or (not name.contains("/") and not name.contains("://")):
+      # Registry name or simple name — use unified install
+      return await t.installer.installByName(name, envVars)
+    else:
+      # URL or owner/repo — store env vars then use GitHub install
+      for (k, v) in envVars:
+        if v.len > 0:
+          discard storeEnvVar(k, v)
+      let mode = if args.hasKey("acquisition_method"): args["acquisition_method"].getStr() else: "auto"
+      let subPath = if args.hasKey("sub_path"): args["sub_path"].getStr() else: ""
+      await t.installer.installFromGitHub(name, mode, subPath)
+      return "Installed skill from: " & name
   except Exception as e:
     return "Error installing skill: " & e.msg

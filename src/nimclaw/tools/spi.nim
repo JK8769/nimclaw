@@ -1,4 +1,4 @@
-import std/[json, tables, strutils, asyncdispatch]
+import std/[json, tables, strutils, asyncdispatch, os]
 import types
 
 type
@@ -96,10 +96,10 @@ when defined(linux):
     pad: uint8
 
   proc spiTransferLinux(device: string, txData: openArray[uint8], speedHz: uint32, mode: uint8, bitsPerWord: uint8): string =
-    let fd = open(device.cstring, O_RDWR, 0)
+    let fd = posix.open(device.cstring, O_RDWR, 0)
     if fd < 0:
       return "Error: Failed to open SPI device '" & device & "'"
-    defer: discard close(fd)
+    defer: discard posix.close(fd)
 
     var modeVal = mode
     if ioctl(fd, SPI_IOC_WR_MODE, addr(modeVal)) != 0:

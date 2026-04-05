@@ -1,0 +1,39 @@
+version: "3.8"
+
+services:
+  nimclaw:
+    build: .
+    image: nimclaw:latest
+    container_name: nimclaw
+    restart: unless-stopped
+    ports:
+      - "18790:18790"
+    volumes:
+      - ${NIMCLAW_DATA:-./.nimclaw}:/data
+    env_file:
+      - ${NIMCLAW_DATA:-./.nimclaw}/.env
+    environment:
+      - NIMCLAW_DIR=/data
+      - OLLAMA_HOST=http://ollama:11434
+    depends_on:
+      - ollama
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: nimclaw-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    # Uncomment for GPU support:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+volumes:
+  ollama_data:

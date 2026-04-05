@@ -1,0 +1,24 @@
+{
+  "name": "Ollama",
+  "apiBase": "http://localhost:11434/v1",
+  "apiKey": "ollama",
+  "defaultModel": "gemma4:31b-cloud",
+  "models": [
+    {
+      "name": "gemma4:31b-cloud",
+      "size": "cloud",
+      "parameters": "31B",
+      "context": 262144,
+      "input": ["text", "vision"],
+      "capabilities": ["thinking", "tools"]
+    },
+    {
+      "name": "gemma4:e2b",
+      "size": "7.2GB",
+      "parameters": "5.1B",
+      "context": 131072,
+      "input": ["text", "vision", "audio"],
+      "capabilities": ["thinking", "tools"]
+    }
+  ]
+}

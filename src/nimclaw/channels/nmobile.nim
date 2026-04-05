@@ -1,4 +1,4 @@
-import std/[asyncdispatch, json, strutils, random, times, tables, os, options, algorithm, httpclient, locks]
+import std/[asyncdispatch, json, strutils, random, times, tables, os, options, algorithm, httpclient, locks, base64]
 import base
 import ../crypto_gcm
 import ../bus, ../bus_types, ../config, ../logger
@@ -33,6 +33,9 @@ type
     pendingNotifications: Table[string, OutboundMessage] # LLM messageId -> Pending Telegram notification
     lastReadMsgId: string # ID of the last sent message that can be cleared by an empty read receipt
     peersFile: string
+    cacheDir: string
+    nknAddress: string  # base wallet address (without identifier prefix)
+    baseDir: string     # .nimclaw/channels/nmobile/<address>/
     botDeviceId: string
     bridge: NknBridge
     inboxLock: Lock
@@ -108,9 +111,22 @@ proc safeFileName(s: string): string =
   if r.len > 120: r = r[0..<120]
   r
 
-proc perGuestCacheDir(src: string): string =
-  let appData = getNimClawDir()
-  appData / "ipfs_cache" / "nmobile" / safeFileName(src)
+proc extCacheDir(c: NMobileChannel, clientAddr: string): string =
+  ## Cache dir for an extension: .nimclaw/channels/nmobile/<address>/<ext>/cache/
+  ## clientAddr is like "Lexi.NKNSkGf..." — extract the extension prefix.
+  if c.baseDir.len > 0:
+    let dotPos = clientAddr.find('.')
+    let ext = if dotPos > 0: clientAddr[0..<dotPos] else: "_default"
+    result = c.baseDir / ext / "cache"
+  else:
+    result = getNimClawDir() / "channels" / "nmobile" / "cache"
+
+proc perGuestCacheDir(c: NMobileChannel, src: string, clientAddr: string = ""): string =
+  c.extCacheDir(clientAddr) / safeFileName(src)
+
+proc mediaCacheDir(c: NMobileChannel, clientAddr: string): string =
+  ## Media dir for an extension: .nimclaw/channels/nmobile/<address>/<ext>/cache/media/
+  c.extCacheDir(clientAddr) / "media"
 
 proc listFilesWithInfo(dir: string): seq[(string, int64, float)] =
   result = @[]
@@ -145,7 +161,7 @@ proc ensureGuestCacheSpace(dir: string, limitBytes, neededBytes: int64) =
       discard
     inc i
 
-proc tryDownloadIpfsToCache*(c: NMobileChannel, src, cid, fileName: string, opts: JsonNode): Future[(bool, string, int64)] {.async.} =
+proc tryDownloadIpfsToCache*(c: NMobileChannel, src, cid, fileName: string, opts: JsonNode, clientAddr: string = ""): Future[(bool, string, int64)] {.async.} =
   if cid.len == 0:
     return (false, "", 0'i64)
   let limitBytes = 100'i64 * 1024'i64 * 1024'i64
@@ -192,7 +208,7 @@ proc tryDownloadIpfsToCache*(c: NMobileChannel, src, cid, fileName: string, opts
   gateways.add("https://ipfs.io/ipfs/" & cid)
   gateways.add("https://cloudflare-ipfs.com/ipfs/" & cid)
 
-  let dir = perGuestCacheDir(src)
+  let dir = c.perGuestCacheDir(src, clientAddr)
   try:
     createDir(dir)
   except:
@@ -316,7 +332,16 @@ proc newNMobileChannel*(cfg: Config, bus: MessageBus): NMobileChannel =
     name: base.name,
     allowList: base.allowList,
     running: false,
-    walletJson: (if fileExists(ncfg.wallet_json): readFile(ncfg.wallet_json) else: ncfg.wallet_json),
+    walletJson: block:
+      # Resolve wallet: check nkn-cli-{addr} dirs, then legacy path, then config value
+      let nmobileDir = appData / "channels" / "nmobile"
+      let legacyWallet = nmobileDir / "wallet.json"
+      if ncfg.wallet_json.len == 0 and fileExists(legacyWallet):
+        readFile(legacyWallet)
+      elif fileExists(ncfg.wallet_json):
+        readFile(ncfg.wallet_json)
+      else:
+        ncfg.wallet_json,
     password: ncfg.password,
     identifier: ncfg.identifier,
     agentIdentifiers: agentMap,
@@ -333,7 +358,8 @@ proc newNMobileChannel*(cfg: Config, bus: MessageBus): NMobileChannel =
     peers: initTable[string, PeerInfo](),
     seenMessages: initTable[string, float](),
     pendingNotifications: initTable[string, OutboundMessage](),
-    peersFile: appData / "nmobile_peers.json",
+    peersFile: appData / "channels" / "nmobile" / "peers.json",  # Migrated to per-addr dir in start()
+    cacheDir: appData / "channels" / "nmobile" / "cache",  # Migrated to per-addr dir in start()
     botDeviceId: "", # Set later
     inbox: @[]
   )
@@ -493,7 +519,29 @@ proc poll(c: NMobileChannel) {.async.} =
                 optionsLogged = optionsToLogString(j["options"])
               
               if contentType == "image" or fileType == "image":
-                finalData = "User sent an image on NKN/NMobile. Media handling is disabled for untrusted guests; please ask them to describe the image or resend via Feishu."
+                # Image data is base64-encoded in j["content"]
+                var imageSaved = false
+                if j.hasKey("content") and j["content"].kind == JString:
+                  let imageData = j["content"].getStr()
+                  if imageData.len > 0:
+                    try:
+                      let decoded = base64.decode(imageData)
+                      if decoded.len > 0:
+                        let mediaDir = c.mediaCacheDir(clientAddr)
+                        createDir(mediaDir)
+                        let ext = if decoded.len >= 3 and decoded[0] == '\xFF' and decoded[1] == '\xD8': ".jpg"
+                                  elif decoded.len >= 4 and decoded[0] == '\x89' and decoded[1] == 'P': ".png"
+                                  elif decoded.len >= 4 and decoded[0] == 'G' and decoded[1] == 'I': ".gif"
+                                  else: ".jpg"
+                        let imgFile = mediaDir / safeFileName(mid) & ext
+                        writeFile(imgFile, decoded)
+                        finalData = "[image: " & imgFile & "]"
+                        imageSaved = true
+                        infoCF("nmobile", "Image saved", {"src": src, "path": imgFile, "bytes": $decoded.len}.toTable)
+                    except:
+                      discard
+                if not imageSaved:
+                  finalData = "User sent an image on NKN/NMobile but it could not be decoded."
               elif contentType == "audio" or fileType == "audio":
                 finalData = "User sent an audio message on NKN/NMobile. Media handling is disabled for untrusted guests; please ask them to summarize the audio or resend via Feishu."
               elif contentType == "video" or fileType == "video":
@@ -512,7 +560,7 @@ proc poll(c: NMobileChannel) {.async.} =
               if contentType == "ipfs" and ipfsCid.len > 0:
                 ipfsCidForMsg = ipfsCid
                 finalData.add(" Cached: pending.")
-                let cacheDir = perGuestCacheDir(src)
+                let cacheDir = c.perGuestCacheDir(src, clientAddr)
                 try:
                   createDir(cacheDir)
                 except:
@@ -544,9 +592,10 @@ proc poll(c: NMobileChannel) {.async.} =
                 let agent2 = agentName
                 let prefix2 = ipfsHashPrefix
                 let len2 = ipfsHashLen
+                let clientAddr2 = clientAddr
                 asyncCheck((proc() {.async.} =
                   infoCF("nmobile", "IPFS cache task start", {"src": src2, "cidPrefix": prefix2}.toTable)
-                  let dl = await c.tryDownloadIpfsToCache(src2, cid2, fn2, opts)
+                  let dl = await c.tryDownloadIpfsToCache(src2, cid2, fn2, opts, clientAddr2)
                   if dl[0] and dl[1].len > 0:
                     var md2 = initTable[string, string]()
                     md2["content_type"] = "ipfs_cached"
@@ -746,27 +795,65 @@ method start*(c: NMobileChannel) {.async.} =
       release(c.inboxLock)
     c.bridge = newNknBridge(onMsg)
 
+    # Resolve NKN address early to set up per-address directory
+    let nmobileDir = getNimClawDir() / "channels" / "nmobile"
+    let (nknAddr, addrErr) = c.bridge.getNKNAddress(c.walletJson, c.password, c.identifier)
+    if addrErr.len == 0 and nknAddr.len > 0:
+      c.nknAddress = nknAddr
+      let addrDir = nmobileDir / nknAddr
+      c.baseDir = addrDir
+      try:
+        createDir(addrDir)
+        # Save wallet to address dir
+        if not fileExists(addrDir / "wallet.json"):
+          writeFile(addrDir / "wallet.json", c.walletJson)
+        # Migrate from legacy nkn-cli-<short> dir
+        let addrShort = if nknAddr.len > 16: nknAddr[0..<16] else: nknAddr
+        let legacyDir = nmobileDir / "nkn-cli-" & addrShort
+        if dirExists(legacyDir):
+          # Migrate peers
+          let legacyPeers = legacyDir / "peers.json"
+          if fileExists(legacyPeers) and not fileExists(addrDir / "peers.json"):
+            copyFile(legacyPeers, addrDir / "peers.json")
+          # Migrate wallet
+          let legacyWallet = legacyDir / "wallet.json"
+          if fileExists(legacyWallet) and not fileExists(addrDir / "wallet.json"):
+            copyFile(legacyWallet, addrDir / "wallet.json")
+          infoCF("nmobile", "Migrated from legacy dir", {"from": "nkn-cli-" & addrShort, "to": nknAddr}.toTable)
+        # Peers file at address level (shared across extensions)
+        let perAddrPeers = addrDir / "peers.json"
+        if not fileExists(perAddrPeers) and fileExists(c.peersFile):
+          copyFile(c.peersFile, perAddrPeers)
+        c.peersFile = perAddrPeers
+        # Default cacheDir (overridden per-extension in message handling)
+        let defaultExt = if c.identifier.len > 0: c.identifier else: "_default"
+        c.cacheDir = addrDir / defaultExt / "cache"
+        createDir(c.cacheDir)
+        infoCF("nmobile", "Using per-address dir", {"dir": nknAddr}.toTable)
+      except:
+        discard  # Fall back to legacy paths
+
     var identifiersToStart: seq[tuple[id, name: string]] = @[]
     if c.identifier.len > 0:
       identifiersToStart.add((c.identifier, ""))
     for name, id in c.agentIdentifiers.pairs:
       identifiersToStart.add((id, name))
-    
+
     if identifiersToStart.len == 0:
       identifiersToStart.add(("", ""))
 
     for (id, name) in identifiersToStart:
       let (clientAddrRes, err) = c.bridge.createNKNClient(
-        c.walletJson, 
-        c.password, 
-        id, 
-        c.numSubClients, 
+        c.walletJson,
+        c.password,
+        id,
+        c.numSubClients,
         c.originalClient
       )
       if err.len > 0:
         errorCF("nmobile", "Failed to create NKN client", {"error": err, "identifier": id}.toTable)
         continue
-      
+
       c.clientAddrs.add(clientAddrRes)
       c.activeClients[clientAddrRes] = name
       if c.botDeviceId == "":

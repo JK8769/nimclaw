@@ -107,7 +107,8 @@ proc downloadFile(c: TelegramChannel, fileID: string, ext: string): Future[strin
     
   let (code, body) = fv.sync()
   if code == 200:
-    let mediaDir = getTempDir() / "nimclaw_media"
+    let botID = c.token.split(":")[0]
+    let mediaDir = getNimClawDir() / "channels" / "telegram" / "bot-" & botID / "cache" / "media"
     createDir(mediaDir)
     let localPath = mediaDir / (fileID[0..min(15, fileID.len-1)] & ext)
     writeFile(localPath, body)

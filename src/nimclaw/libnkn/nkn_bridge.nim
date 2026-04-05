@@ -19,13 +19,15 @@ type
     running*: bool
 
 proc findBridgeBinary(): string =
-  # Look next to the source, next to the executable, then on PATH
+  # Look in channels/bin/nkn-cli, next to executable, then on PATH
   let srcDir = currentSourcePath().parentDir()
-  for dir in [srcDir, getAppDir(), ""]:
-    for name in ["nkn_bridge", "nkn-bridge"]:
-      let path = if dir.len > 0: dir / name else: findExe(name)
-      if path.len > 0 and fileExists(path):
-        return path
+  let binDir = srcDir / ".." / ".." / ".." / "channels" / "bin"
+  let path = binDir / "nkn-cli"
+  if fileExists(path): return path
+  let appPath = getAppDir() / "nkn-cli"
+  if fileExists(appPath): return appPath
+  let onPath = findExe("nkn-cli")
+  if onPath.len > 0: return onPath
   return ""
 
 proc sendRequest(b: NknBridge, meth: string, params: JsonNode): JsonNode =

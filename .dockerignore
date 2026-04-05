@@ -1,0 +1,12 @@
+.nimclaw*/
+.env
+.git
+.github
+*.dylib
+nimclaw
+libnkn.dylib
+node_modules
+package-lock.json
+test_*
+tests/
+docs/

@@ -16,7 +16,8 @@
 ## receive the full `McpRequestContext`. This enables flexible and powerful
 ## resource management for complex applications.
 
-import tables, strutils, re, options
+import tables, strutils, options
+import regex
 import types, context
 
 type
@@ -27,7 +28,7 @@ type
   
   UriTemplateMatcher* = object
     ## Compiled URI template for efficient matching
-    pattern*: Regex
+    pattern*: Regex2
     paramNames*: seq[string]
     uriTemplate*: string
   
@@ -42,37 +43,35 @@ proc compileUriTemplate*(uriTemplate: string): UriTemplateMatcher =
   var paramNames: seq[string] = @[]
   
   # Find all template parameters {paramName}
-  let paramRegex = re"\{([^}]*)\}"
-  var matches: array[1, string]
+  let paramRegex = re2"\{([^}]*)\}"
+  var m: RegexMatch2
   var start = 0
-  
-  while regexPattern.find(paramRegex, matches, start) != -1:
-    let paramName = matches[0]
+
+  while regexPattern.find(paramRegex, m, start):
+    let paramName = regexPattern[m.group(0)]
     if paramName.len == 0:
       raise newException(ValueError, "Invalid template: empty parameter name found")
     paramNames.add(paramName)
-    # Replace {paramName} with capture group
     regexPattern = regexPattern.replace("{" & paramName & "}", "([^/]+)")
-    start = 0  # Restart search after replacement
-  
+    start = 0
+
   # Anchor the pattern to match full URI
   regexPattern = "^" & regexPattern & "$"
-  
+
   UriTemplateMatcher(
-    pattern: re(regexPattern),
+    pattern: re2(regexPattern),
     paramNames: paramNames,
     uriTemplate: uriTemplate
   )
 
 proc matchUri*(matcher: UriTemplateMatcher, uri: string): Option[Table[string, string]] =
   ## Match a URI against a template and extract parameters
-  var matches = newSeq[string](matcher.paramNames.len)
-  
-  if uri.match(matcher.pattern, matches):
+  var m: RegexMatch2
+
+  if uri.match(matcher.pattern, m):
     var params = initTable[string, string]()
     for i, paramName in matcher.paramNames:
-      if i < matches.len:
-        params[paramName] = matches[i]
+      params[paramName] = uri[m.group(i)]
     return some(params)
 
   none(Table[string, string])

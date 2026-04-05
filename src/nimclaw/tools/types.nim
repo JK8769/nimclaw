@@ -20,11 +20,17 @@ type
     identity*: string
 
   Tool* = ref object of RootObj
+    toolTags*: seq[string]  ## Tags for discovery, ordered by importance (first = primary)
+    searchHint*: string     ## Curated 3-10 word phrase for find_tools discovery
 
 method name*(t: Tool): string {.base.} = ""
 method description*(t: Tool): string {.base.} = ""
 method parameters*(t: Tool): Table[string, JsonNode] {.base.} = initTable[string, JsonNode]()
 method execute*(t: Tool, args: Table[string, JsonNode]): Future[string] {.base, async.} = return ""
+
+proc tags*(t: Tool): seq[string] = t.toolTags
+proc setTags*(t: Tool, tags: seq[string]) = t.toolTags = tags
+proc setSearchHint*(t: Tool, hint: string) = t.searchHint = hint
 
 type
   ContextualTool* = ref object of Tool
@@ -41,7 +47,7 @@ type
     appID*: string
     replyToMessageID*: string
 
-  SendCallback* = proc(channel, chatID, content, senderAgent, replyToMessageID, appID: string): Future[void]
+  SendCallback* = proc(channel, chatID, content, senderAgent, replyToMessageID, appID: string, metadata: Table[string, string] = initTable[string, string]()): Future[void]
 
 method setContext*(t: ContextualTool, ctx: ToolContext) {.base.} =
   t.channel = ctx.channel

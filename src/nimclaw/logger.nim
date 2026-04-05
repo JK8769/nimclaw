@@ -1,4 +1,4 @@
-import std/[times, strutils, json, syncio, tables]
+import std/[times, strutils, json, syncio, tables, os]
 import jsony
 
 type
@@ -13,11 +13,20 @@ const
     ERROR: "ERROR",
     FATAL: "FATAL"
   }.toTable
+  maxLogSize = 5 * 1024 * 1024  # 5MB
 
 var
   currentLevel = INFO
   logFile: File
+  logFilePath {.global.}: array[1024, char]
+  logFilePathLen: int
+  logFileSize: int64
   fileLoggingEnabled = false
+
+proc getLogPath(): string =
+  result = newString(logFilePathLen)
+  for i in 0..<logFilePathLen:
+    result[i] = logFilePath[i]
 
 type
   LogEntry* = object
@@ -39,12 +48,30 @@ proc enableFileLogging*(filePath: string): bool =
     if fileLoggingEnabled:
       logFile.close()
     logFile = open(filePath, fmAppend)
+    logFilePathLen = min(filePath.len, logFilePath.len)
+    for i in 0..<logFilePathLen:
+      logFilePath[i] = filePath[i]
+    logFileSize = getFileSize(filePath)
     fileLoggingEnabled = true
     echo "File logging enabled: ", filePath
     return true
   except:
     echo "Failed to open log file: ", filePath
     return false
+
+proc rotateLogFile() {.gcsafe.} =
+  ## Rotate when log exceeds maxLogSize. Keeps one backup (.1).
+  let path = getLogPath()
+  try:
+    logFile.close()
+    let backup = path & ".1"
+    if fileExists(backup): removeFile(backup)
+    moveFile(path, backup)
+    logFile = open(path, fmAppend)
+    logFileSize = 0
+  except:
+    try: logFile = open(path, fmAppend)
+    except: fileLoggingEnabled = false
 
 proc disableFileLogging*() =
   if fileLoggingEnabled:
@@ -79,8 +106,12 @@ proc logMessage(level: LogLevel, component: string, message: string, fields: Tab
 
   if fileLoggingEnabled:
     try:
-      logFile.writeLine(entry.toJson() & "\n")
+      let line = entry.toJson() & "\n"
+      logFile.writeLine(line)
       logFile.flushFile()
+      logFileSize += line.len + 1
+      if logFileSize >= maxLogSize:
+        rotateLogFile()
     except:
       discard
 

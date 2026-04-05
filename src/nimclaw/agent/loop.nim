@@ -1,11 +1,12 @@
-import std/[json, strutils, asyncdispatch, tables, locks, os, options]
+import std/[json, strutils, asyncdispatch, tables, locks, os, options, sets]
 import ../bus, ../bus_types, ../config, ../logger, ../providers/types as providers_types, ../session, ../utils
 import context as agent_context
 import xml_tools
 import ../schema
 import ../tools/registry as tools_registry
 import ../tools/base as tools_base
-import ../tools/[filesystem, edit, shell, spawn, subagent, web, message, reply, forward, remember, memory_store, memory_list, memory_recall, memory_forget, http_request, git, pushover, screenshot, image_info, composio, browser_open, hardware_info, hardware_memory, i2c, spi, delegate, cron, forge, list, persist, invite, query_graph, skill_install, config_tools, orchestrate, update_contact, jq, clock]
+import ../tools/loop_detector
+import ../tools/[filesystem, edit, shell, spawn, subagent, web, message, reply, forward, remember, memory_unified, http_request, git, pushover, screenshot, image_info, image_analyze, browser_open, hardware_unified, delegate, cron, find, mcp_unified, invite, query_graph, skill_install, config_tools, tasks_unified, update_contact, jq, clock, lark, playwright]
 import ../services/cron as cron_service
 import curly
 import ../lib/malebolgia
@@ -61,6 +62,7 @@ type
     sessions*: SessionManager
     contextBuilder*: ContextBuilder
     tools*: ToolRegistry
+    findTool*: FindTools
     cronService*: CronService
     running*: bool
     summarizing*: Table[string, bool]
@@ -237,21 +239,43 @@ proc runLLMIteration(al: AgentLoop, ctx: TaskContext, messages: seq[providers_ty
   var iteration = 0
   var finalContent = ""
   var lastResponseContent = ""  # Track last response for loop exhaustion fallback
+  var emptyNameRetries = 0
+  var emptyRetries = 0
+  var toolCallLog: seq[string] = @[]  # Track tool calls for forced summary
+  var loopDetector = newLoopDetector()
   var currentMessages = messages
   let useXmlTools = isXmlToolProvider(al.model)
   let toolCtx = buildToolContext(al, opts, logicalUserID)
 
-  while iteration < al.maxIterations:
+  # Sanitize: remove orphaned tool messages (tool without preceding tool_calls)
+  block:
+    var clean: seq[providers_types.Message] = @[]
+    var lastHadToolCalls = false
+    for m in currentMessages:
+      if m.role == "tool":
+        if not lastHadToolCalls:
+          continue  # Skip orphaned tool result
+      clean.add(m)
+      lastHadToolCalls = (m.role == "assistant" and m.tool_calls.len > 0)
+    if clean.len != currentMessages.len:
+      warnCF("agent", "Removed orphaned tool messages from history", {"removed": $(currentMessages.len - clean.len)}.toTable)
+      currentMessages = clean
+
+  while iteration < al.maxIterations and finalContent == "":
     iteration += 1
     al.updateStatus(ctx, "Thinking", "Running iteration", iteration)
-    
+
     infoCF("agent", "LLM iteration", {"iteration": $iteration, "max": $al.maxIterations, "xml_tools": $useXmlTools, "messages_count": $currentMessages.len}.toTable)
 
     let strategy = inferStrategy(al.model)
 
-    # Tool definitions are constant for the entire request — compute once
+    # Tick TTL each iteration (tools expire after N turns of non-use)
+    if al.findTool != nil and iteration > 1:
+      al.findTool.tickTTL()
+
+    # Deferred tool loading: core tools get full schemas, hidden tools listed in taxonomy
     if iteration == 1:
-      infoCF("agent", "Getting tool definitions", {"strategy": $strategy, "available_tools": $al.tools.list()}.toTable)
+      infoCF("agent", "Getting tool definitions (deferred mode)", {"strategy": $strategy, "total": $al.tools.count()}.toTable)
     let toolDefs =
       if useXmlTools:
         @[]
@@ -260,7 +284,16 @@ proc runLLMIteration(al: AgentLoop, ctx: TaskContext, messages: seq[providers_ty
         if roleLow in ["guest", "customer"]:
           al.tools.getDefinitionsFiltered(strategy, @(tools_registry.ExternalAllowedTools))
         else:
-          al.tools.getDefinitions(strategy)
+          let activatedSet = if al.findTool != nil: al.findTool.getActivatedSet()
+                             else: initHashSet[string]()
+          let (defs, hiddenNames) = al.tools.getDefinitionsDeferred(strategy, activatedSet)
+          # Inject taxonomy into system message on first iteration
+          if iteration == 1 and hiddenNames.len > 0:
+            let taxonomy = al.tools.generateTaxonomy()
+            if taxonomy.len > 0 and currentMessages.len > 0 and currentMessages[0].role == "system":
+              currentMessages[0].content.add("\n\n## Additional Tools\nUse `find_tools` to activate tools from these categories:\n" & taxonomy)
+              infoCF("agent", "Deferred tool loading", {"core_schemas": $defs.len, "hidden": $hiddenNames.len, "activated": $activatedSet.len}.toTable)
+          defs
 
     let options = {
       "max_tokens": %al.contextWindow,
@@ -285,8 +318,9 @@ proc runLLMIteration(al: AgentLoop, ctx: TaskContext, messages: seq[providers_ty
     if al.model != al.cfg.agents.defaults.model: llmMeta["model"] = %al.model
     al.logAction(ctx, atInference, tokens, llmMeta)
     
-    # Track last response for fallback
-    lastResponseContent = response.content
+    # Track last non-empty response for fallback
+    if response.content.len > 0:
+      lastResponseContent = response.content
     infoCF("agent", "LLM response received", {"iteration": $iteration, "content_len": $response.content.len, "content_preview": truncate(response.content, 200)}.toTable)
 
     if useXmlTools:
@@ -342,46 +376,174 @@ proc runLLMIteration(al: AgentLoop, ctx: TaskContext, messages: seq[providers_ty
     else:
       # Native tool calling path (unchanged)
       if response.tool_calls.len == 0:
-        finalContent = response.content
+        if response.content.len > 0:
+          let trimmed = response.content.strip()
+          # Detect incomplete responses: LLM describes next steps instead of giving results
+          # Nudge up to 2 times if we're mid-task and response is short status text
+          let looksIncomplete = iteration > 3 and toolCallLog.len >= 3 and trimmed.len < 200 and
+            (trimmed.endsWith(":") or trimmed.endsWith("：") or trimmed.endsWith(",") or
+             trimmed.endsWith("。") or trimmed.endsWith("."))
+          if looksIncomplete and emptyRetries < 2:
+            emptyRetries.inc
+            warnCF("agent", "LLM returned short status without tool calls, nudging to continue", {"iteration": $iteration, "retry": $emptyRetries, "preview": trimmed[0..min(trimmed.len-1, 80)]}.toTable)
+            currentMessages.add(providers_types.Message(role: "assistant", content: response.content))
+            currentMessages.add(providers_types.Message(role: "user", content: "You described what you plan to do but did not do it. Use tools NOW to complete the task, then provide the final result to the user."))
+            continue
+          finalContent = response.content
+        elif iteration > 1:
+          # LLM returned empty after tool iterations — nudge to continue, then force summary
+          emptyRetries.inc
+          if emptyRetries <= 2:
+            warnCF("agent", "LLM returned empty, nudging to continue", {"iteration": $iteration, "retry": $emptyRetries}.toTable)
+            currentMessages.add(providers_types.Message(role: "user", content: "Continue with the task. Use tools to complete it, then reply to the user with the results."))
+            continue
+          else:
+            warnCF("agent", "LLM returned empty 3 times, forcing summary", {"iteration": $iteration}.toTable)
+            var summaryPrompt = "Provide your FINAL response to the user NOW."
+            if toolCallLog.len > 0:
+              summaryPrompt.add("\n\nHere is what you did so far:\n" & toolCallLog.join("\n") & "\n\nSummarize the results, including any errors or failures. If a step failed, tell the user.")
+            else:
+              summaryPrompt.add(" Summarize what you accomplished and any results from the tools you used.")
+            # Build compact context to avoid overwhelming the model
+            var summaryMessages: seq[providers_types.Message] = @[]
+            summaryMessages.add(currentMessages[0])  # system message
+            let recentStart = max(1, currentMessages.len - 4)
+            for i in recentStart ..< currentMessages.len:
+              summaryMessages.add(currentMessages[i])
+            summaryMessages.add(providers_types.Message(role: "user", content: summaryPrompt))
+            try:
+              let summaryDefs: seq[ToolDefinition] = @[]
+              let summaryOpts = {"max_tokens": %4096, "temperature": %al.temperature}.toTable
+              let summaryResp = await al.provider.chat(summaryMessages, summaryDefs, al.model, summaryOpts)
+              if summaryResp.content.len > 0:
+                finalContent = summaryResp.content
+            except Exception as e:
+              warnCF("agent", "Summary call failed, using last content", {"error": e.msg}.toTable)
+            if finalContent == "" and lastResponseContent.len > 0:
+              finalContent = lastResponseContent
         infoCF("agent", "LLM response without tool calls", {"iteration": $iteration}.toTable)
         break
 
+      # Filter out degenerate tool calls with empty names (DeepSeek failure mode)
+      # Try to infer tool name from response content or arguments before discarding
+      var validCalls: seq[providers_types.ToolCall] = @[]
+      let allToolNames = al.tools.list()
+      for tc in response.tool_calls:
+        if tc.name.strip().len > 0:
+          validCalls.add(tc)
+        else:
+          # Try to infer tool name from response content
+          var inferred = ""
+          let contentLow = response.content.toLowerAscii()
+          for tn in allToolNames:
+            if tn.toLowerAscii() in contentLow:
+              if inferred.len == 0 or tn.len > inferred.len:  # prefer longest match
+                inferred = tn
+          if inferred.len > 0:
+            warnCF("agent", "Inferred tool name from content", {"id": tc.id, "inferred": inferred, "iteration": $iteration}.toTable)
+            var fixedTc = tc
+            fixedTc.name = inferred
+            validCalls.add(fixedTc)
+          else:
+            warnCF("agent", "Skipping tool call with empty name", {"id": tc.id, "iteration": $iteration}.toTable)
+
+      if validCalls.len == 0:
+        # All tool calls had empty names — nudge to retry (up to 3 times)
+        emptyNameRetries += 1
+        if emptyNameRetries > 3:
+          warnCF("agent", "Too many empty tool name retries, breaking", {"iteration": $iteration}.toTable)
+          if response.content.len > 0: finalContent = response.content
+          break
+        warnCF("agent", "LLM returned empty tool names, nudging to continue", {"iteration": $iteration, "retry": $emptyNameRetries}.toTable)
+        if response.content.len > 0:
+          currentMessages.add(providers_types.Message(role: "assistant", content: response.content))
+        currentMessages.add(providers_types.Message(role: "user", content: "Your last tool call had an empty function name. Please call the tool again with the correct name. For browser actions, use the 'playwright' tool with an action parameter."))
+        continue
+
+      emptyNameRetries = 0  # Reset on successful tool calls
       if opts.streamIntermediary and response.content.len > 0:
         al.bus.publishOutbound(newOutbound(opts.channel, opts.recipientID, opts.chatID, response.content, opts.replyToMessageID, opts.appID))
 
-      var assistantMsg = providers_types.Message(role: "assistant", content: response.content, reasoning_content: response.reasoning_content, tool_calls: response.tool_calls)
+      var assistantMsg = providers_types.Message(role: "assistant", content: response.content, reasoning_content: response.reasoning_content, tool_calls: validCalls)
       currentMessages.add(assistantMsg)
       al.sessions.addFullMessage(opts.sessionKey, assistantMsg)
 
       var toolMeta = newJObject()
       var toolNames = newJArray()
-      for tc in response.tool_calls: toolNames.add(%tc.name)
+      for tc in validCalls: toolNames.add(%tc.name)
       if toolNames.len > 0:
         toolMeta["tools"] = toolNames
         toolMeta["iteration"] = %iteration
         al.logAction(ctx, atToolCall, 0, toolMeta)
         al.updateStatus(ctx, "Executing Tools", "Processing " & $toolNames.len & " tools", iteration)
 
-      for tc in response.tool_calls:
+      for tc in validCalls:
+        # Loop detection: catch identical repeated tool calls
+        let argsJson = if tc.arguments.len > 0: %*tc.arguments else: newJObject()
+        let loopResult = loopDetector.record(tc.name, argsJson)
+        if loopResult == lrStop:
+          warnCF("agent", "Tool loop detected, forcing summary", {"tool": tc.name, "streak": $loopDetector.streak}.toTable)
+          # Build compact summary context with tool call log
+          var loopPrompt = "STOP. You have called `" & tc.name & "` with identical arguments " & $loopDetector.streak & " times — this is a stuck loop. Do NOT call any more tools. Provide your FINAL response to the user NOW."
+          if toolCallLog.len > 0:
+            loopPrompt.add("\n\nHere is what you did:\n" & toolCallLog.join("\n") & "\n\nSummarize the results, including any errors or failures. If a step failed, tell the user what went wrong and suggest they try manually.")
+          var summaryMessages: seq[providers_types.Message] = @[]
+          summaryMessages.add(currentMessages[0])
+          let recentStart = max(1, currentMessages.len - 4)
+          for i in recentStart ..< currentMessages.len:
+            summaryMessages.add(currentMessages[i])
+          summaryMessages.add(providers_types.Message(role: "user", content: loopPrompt))
+          try:
+            let toolDefs: seq[ToolDefinition] = @[]
+            let summaryOpts = {"max_tokens": %4096, "temperature": %al.temperature}.toTable
+            let summaryResp = await al.provider.chat(summaryMessages, toolDefs, al.model, summaryOpts)
+            if summaryResp.content.len > 0:
+              finalContent = summaryResp.content
+          except Exception as e:
+            errorCF("agent", "Loop summary call failed", {"error": e.msg}.toTable)
+          if finalContent == "":
+            finalContent = "I got stuck in a loop trying to use `" & tc.name & "`. The operation could not be completed. Please try a different approach."
+          break
+        elif loopResult == lrWarn:
+          let msg = loopDetector.message()
+          warnCF("agent", "Tool loop warning", {"tool": tc.name, "streak": $loopDetector.streak}.toTable)
+          currentMessages.add(providers_types.Message(role: "tool", content: msg, tool_call_id: tc.id, name: tc.name))
+          continue  # Skip execution, deliver the warning as the tool result
+
         infoCF("agent", "Tool call: " & tc.name, {"tool": tc.name, "iteration": $iteration, "role": al.role}.toTable)
+        emptyRetries = 0  # Reset on successful tool call
         if tc.name == "reply" or tc.name == "message":
           ctx.responseSent = true
         let result = await al.tools.executeWithContext(tc.name, tc.arguments, toolCtx)
+        # Record in tool call log for forced summary context
+        let resultPreview = if result.len > 200: result[0..199] & "..." else: result
+        toolCallLog.add("[" & $iteration & "] " & tc.name & " → " & resultPreview)
         let toolResultMsg = providers_types.Message(role: "tool", content: result, tool_call_id: tc.id, name: tc.name)
         currentMessages.add(toolResultMsg)
         al.sessions.addFullMessage(opts.sessionKey, toolResultMsg)
 
   # If loop exhausted maxIterations without breaking, make one final LLM call for summary
-  if finalContent == "" and lastResponseContent != "":
-    warnCF("agent", "Tool loop exhausted maxIterations without final response", {"iterations": $iteration, "max": $al.maxIterations}.toTable)
-    
-    # Always do a summary call — the last response was a tool call, not a real answer
+  if finalContent == "" and (lastResponseContent != "" or toolCallLog.len > 0):
+    warnCF("agent", "Tool loop exhausted maxIterations without final response", {"iterations": $iteration, "max": $al.maxIterations, "tool_calls": $toolCallLog.len}.toTable)
+
+    # Build a compact context for the summary call — full message history is too long for GLM-5
     infoCF("agent", "Making final summary LLM call after loop exhaustion", initTable[string, string]())
-    currentMessages.add(providers_types.Message(role: "user", content: "STOP using tools. You have reached the maximum number of tool iterations (" & $al.maxIterations & "). Provide your FINAL response to the user NOW. Summarize what you accomplished and any results from the tools you used. Do NOT call any more tools."))
+    var exhaustPrompt = "You were performing a task for the user but reached the maximum number of tool iterations (" & $al.maxIterations & "). Provide your FINAL response to the user NOW. Do NOT call any tools."
+    if toolCallLog.len > 0:
+      exhaustPrompt.add("\n\nHere is what you did:\n" & toolCallLog.join("\n") & "\n\nSummarize the results, including any errors or failures. If a step failed, tell the user what went wrong.")
+    else:
+      exhaustPrompt.add(" Summarize what you accomplished and any results from the tools you used.")
+    # Use only system + last few messages + summary prompt to avoid context overflow
+    var summaryMessages: seq[providers_types.Message] = @[]
+    summaryMessages.add(currentMessages[0])  # system message
+    let recentStart = max(1, currentMessages.len - 4)
+    for i in recentStart ..< currentMessages.len:
+      summaryMessages.add(currentMessages[i])
+    summaryMessages.add(providers_types.Message(role: "user", content: exhaustPrompt))
     try:
       let toolDefs: seq[ToolDefinition] = @[]
       let summaryOpts = {"max_tokens": %4096, "temperature": %al.temperature}.toTable
-      let summaryResp = await al.provider.chat(currentMessages, toolDefs, al.model, summaryOpts)
+      let summaryResp = await al.provider.chat(summaryMessages, toolDefs, al.model, summaryOpts)
       if summaryResp.content.len > 0:
         let cleaned = extractTextFromResponse(summaryResp.content)
         finalContent = if cleaned.len > 0: cleaned else: summaryResp.content
@@ -718,22 +880,31 @@ proc newAgentLoop*(cfg: Config, msgBus: MessageBus, provider: LLMProvider, agent
     if s.location notin allowedPaths:
       allowedPaths.add(s.location)
 
-  toolsRegistry.register(newReadFileTool(workspace, officeDir, allowedPaths))
-  toolsRegistry.register(newWriteFileTool(workspace, officeDir, allowedPaths))
-  toolsRegistry.register(newListDirTool(workspace, officeDir, allowedPaths))
-  toolsRegistry.register(newExecTool(workspace))
-  toolsRegistry.register(newClockTool())
+  # Helper: register a tool with tags and optional searchHint
+  template regTagged(tool: untyped, tagList: openArray[string], hint: string = "") =
+    let t = tool
+    t.setTags(@tagList)
+    if hint.len > 0: t.setSearchHint(hint)
+    toolsRegistry.register(t)
 
-  toolsRegistry.register(newWebSearchTool(cfg.tools.web.search.api_key, cfg.tools.web.search.max_results, toolCurly, createMaster()))
-  toolsRegistry.register(newWebFetchTool(50000, toolCurly, createMaster()))
-  toolsRegistry.register(newHttpRequestTool())
-  toolsRegistry.register(newGitTool(workspace, cfg.agents.security.allowed_paths, officeDir))
-  toolsRegistry.register(newPushoverTool(workspace))
-  toolsRegistry.register(newScreenshotTool(workspace))
-  toolsRegistry.register(newImageInfoTool())
-  
-  let composioKey = getEnv("COMPOSIO_API_KEY", "")
-  toolsRegistry.register(newComposioTool(composioKey))
+  # --- Core tools (filesystem, exec, clock) ---
+  regTagged(newReadFileTool(workspace, officeDir, allowedPaths), ["filesystem", "data", "core"], "read file contents from disk")
+  regTagged(newWriteFileTool(workspace, officeDir, allowedPaths), ["filesystem", "data", "core"], "write or create files on disk")
+  regTagged(newListDirTool(workspace, officeDir, allowedPaths), ["filesystem", "data", "core"], "list directory contents")
+  regTagged(newExecTool(workspace), ["system", "dev", "automation", "core"], "run shell commands and scripts")
+  regTagged(newClockTool(), ["utility", "core"], "get current date and time")
+
+  # --- Web tools ---
+  regTagged(newWebSearchTool(cfg.tools.web.search.api_key, cfg.tools.web.search.max_results, toolCurly, createMaster()), ["web", "search", "data"], "search the internet for information")
+  regTagged(newWebFetchTool(50000, toolCurly, createMaster()), ["web", "http", "data"], "fetch webpage or URL content")
+  regTagged(newHttpRequestTool(), ["web", "http", "api"], "make HTTP API requests with headers")
+
+  # --- Dev tools ---
+  regTagged(newGitTool(workspace, cfg.agents.security.allowed_paths, officeDir), ["git", "devops", "vcs"], "git version control operations")
+  regTagged(newPushoverTool(workspace), ["messaging", "notification"], "send push notifications via Pushover")
+  regTagged(newScreenshotTool(workspace), ["visual", "utility"], "capture screenshots of display")
+  regTagged(newImageInfoTool(), ["visual", "data"], "get image dimensions and metadata")
+  regTagged(newImageAnalyzeTool(), ["visual", "vision", "image"], "analyze image content using vision model")
 
   let allowedDomainsStr = getEnv("BROWSER_ALLOWED_DOMAINS", "")
   var allowedBrowserDomains: seq[string] = @[]
@@ -741,66 +912,78 @@ proc newAgentLoop*(cfg: Config, msgBus: MessageBus, provider: LLMProvider, agent
     for d in allowedDomainsStr.split(','):
       let t = d.strip()
       if t.len > 0: allowedBrowserDomains.add(t)
-      
-  toolsRegistry.register(newBrowserOpenTool(allowedBrowserDomains))
 
-  let callback: SendCallback = proc(channel, chatID, content, senderAgent, replyToMessageID, appID: string): Future[void] {.async.} =
-    msgBus.publishOutbound(newOutbound(channel, senderAgent, chatID, content, replyToMessageID, appID))
+  regTagged(newBrowserOpenTool(allowedBrowserDomains), ["browser", "web"], "open URLs in web browser")
+
+  let callback: SendCallback = proc(channel, chatID, content, senderAgent, replyToMessageID, appID: string, metadata: Table[string, string] = initTable[string, string]()): Future[void] {.async.} =
+    msgBus.publishOutbound(newOutbound(channel, senderAgent, chatID, content, replyToMessageID, appID, metadata))
 
 
 
+  # --- Agent & delegation ---
   let subagentManager = newSubagentManager(provider, workspace, msgBus, toolsRegistry, nil)
-  toolsRegistry.register(newSpawnTool(subagentManager))
+  regTagged(newSpawnTool(subagentManager), ["agent", "automation"], "spawn autonomous sub-agents for tasks")
 
-  toolsRegistry.register(newHardwareBoardInfoTool(cfg.peripherals.boards))
-  toolsRegistry.register(newHardwareMemoryTool(cfg.peripherals.boards))
-  toolsRegistry.register(newI2cTool())
-  toolsRegistry.register(newSpiTool())
-  toolsRegistry.register(newDelegateTool(workspace, cfg.agents.named))
-  toolsRegistry.register(newRedeemInviteTool())
+  # --- Hardware (unified) ---
+  regTagged(newUnifiedHardwareTool(cfg.peripherals.boards), ["hardware", "sensors", "i2c", "spi"], "I2C SPI board info memory read write hardware peripherals")
+  regTagged(newDelegateTool(workspace, cfg.agents.named), ["agent", "delegation"], "delegate tasks to other named agents")
+  regTagged(newRedeemInviteTool(), ["admin", "core"])
 
-  # Orchestration Tools
-  toolsRegistry.register(newSendMailTool(workspace))
-  toolsRegistry.register(newTaskOrchestratorTool(workspace))
-  toolsRegistry.register(newClaimTaskTool(workspace))
-  toolsRegistry.register(newSubmitTaskTool(workspace))
-  toolsRegistry.register(newUpdateContactTool(officeDir))
+  # --- Tasks & orchestration (unified) ---
+  regTagged(newNimclawTool(workspace), ["orchestration", "automation", "messaging"], "assign claim submit tasks send mail to agents")
+  regTagged(newUpdateContactTool(officeDir), ["admin", "contacts", "core"], "update contact information in graph")
 
-  toolsRegistry.register(newEditFileTool(workspace))
-  toolsRegistry.register(newAppendFileTool(workspace))
-  toolsRegistry.register(newPersistTool(toolsRegistry))
-  toolsRegistry.register(newPersistSkillTool(toolsRegistry))
-  toolsRegistry.register(newForgeTool(toolsRegistry, officeDir))
-  toolsRegistry.register(newPurgeMcpTool(toolsRegistry, officeDir))
-  toolsRegistry.register(newSetApiKeyTool(getConfigPath()))
-  toolsRegistry.register(newJqTool(workspace))
-  
+  # --- Filesystem (edit, append) ---
+  regTagged(newEditFileTool(workspace), ["filesystem", "data", "core"], "edit files with find and replace")
+  regTagged(newAppendFileTool(workspace), ["filesystem", "data"], "append content to existing files")
+
+  # --- Admin & config ---
+  regTagged(newUnifiedMcpTool(toolsRegistry, officeDir), ["admin", "mcp", "skills"], "forge persist purge MCP tool servers skills")
+  regTagged(newSetApiKeyTool(getConfigPath()), ["admin", "config"], "configure API keys and secrets")
+  regTagged(newJqTool(workspace), ["data", "utility"], "transform JSON data with jq expressions")
+
   let installer = newSkillInstaller(officeDir)
-  toolsRegistry.register(newSkillInstallTool(installer))
-  
+  regTagged(newSkillInstallTool(installer), ["admin", "skills"], "install skill plugins from URL or path")
+
   let sessionsManager = newSessionManager(officeDir / "sessions")
   let contextBuilder = newContextBuilder(officeDir, workspace, cfg.agents.named)
   contextBuilder.tools = toolsRegistry # Manually bridge for now
 
+  # --- Messaging (core) ---
   let msgTool = newMessageTool()
   msgTool.setSendCallback(callback)
-  
   let injectCb: InjectSessionCallback = proc(sessionKey, role, content: string): Future[void] {.async.} =
     sessionsManager.addMessage(sessionKey, role, content)
     sessionsManager.save(sessionsManager.getOrCreate(sessionKey))
   msgTool.setInjectCallback(injectCb)
+  msgTool.setTags(@["messaging", "core"])
+  msgTool.setSearchHint("send message to a specific person")
   toolsRegistry.register(msgTool)
 
   let rTool = newReplyTool()
   rTool.setSendCallback(callback)
+  rTool.setTags(@["messaging", "core"])
+  rTool.setSearchHint("reply to current conversation")
   toolsRegistry.register(rTool)
+
+  let larkTool = newLarkCliTool()
+  if larkTool.larkCliBin.len > 0:
+    larkTool.setTags(@["feishu", "lark", "docs", "calendar", "platform"])
+    larkTool.setSearchHint("feishu lark docs sheets calendar tasks")
+    toolsRegistry.register(larkTool)
 
   let fwdTool = newForwardTool(officeDir)
   fwdTool.setSendCallback(callback)
+  fwdTool.setTags(@["messaging", "core"])
+  fwdTool.setSearchHint("forward message to another chat")
   toolsRegistry.register(fwdTool)
 
-  toolsRegistry.register(newListTools(toolsRegistry))
-  toolsRegistry.register(newQueryGraphTool(contextBuilder))
+  # --- Discovery & meta ---
+  let findToolInstance = newFindTools(toolsRegistry)
+  findToolInstance.setTags(@["utility", "core"])
+  findToolInstance.setSearchHint("discover and activate hidden tools")
+  toolsRegistry.register(findToolInstance)
+  regTagged(newQueryGraphTool(contextBuilder), ["admin", "graph", "core"], "query world graph entities and relations")
 
   # Phase 400: Scan persistent libraries and OS tools
   let nimclawBase = getHomeDir() / ".nimclaw"
@@ -840,11 +1023,20 @@ proc newAgentLoop*(cfg: Config, msgBus: MessageBus, provider: LLMProvider, agent
             # Use agent's name as session key for personal forged tools so they persist
             discard toolsRegistry.registerMcpServer(binaryPath, @[], agentName, @[])
   
+  # Phase 402: Register Playwright CLI tool (browser automation)
+  # Uses @playwright/cli — a token-efficient CLI designed for AI agents.
+  # Single tool with command parameter, replaces 21 individual MCP tools.
+  let npxPath = findExe("npx")
+  if npxPath.len > 0:
+    let pwDir = getNimClawDir() / "plugins" / "playwright"
+    try: createDir(pwDir)
+    except: discard
+    let pwTool = newPlaywrightTool(pwDir)
+    regTagged(pwTool, ["browser", "web", "ui", "automation"], "browser navigate click type screenshot playwright web automation")
+
+  # --- Memory (unified) ---
   let markdownMemory = newMarkdownMemory(officeDir, workspace)
-  toolsRegistry.register(newMemoryStoreTool(markdownMemory))
-  toolsRegistry.register(newMemoryListTool(markdownMemory))
-  toolsRegistry.register(newMemoryRecallTool(markdownMemory))
-  toolsRegistry.register(newMemoryForgetTool(markdownMemory))
+  regTagged(newUnifiedMemoryTool(markdownMemory), ["memory", "data", "core"], "store recall list forget memory facts preferences")
 
   var al = AgentLoop(
     bus: msgBus,
@@ -863,6 +1055,7 @@ proc newAgentLoop*(cfg: Config, msgBus: MessageBus, provider: LLMProvider, agent
     sessions: sessionsManager,
     contextBuilder: contextBuilder,
     tools: toolsRegistry,
+    findTool: findToolInstance,
     cronService: cronService,
     summarizing: initTable[string, bool](),
     agentId: "",
@@ -890,7 +1083,7 @@ proc newAgentLoop*(cfg: Config, msgBus: MessageBus, provider: LLMProvider, agent
       )
       return await al.processMessage(msg)
     
-    toolsRegistry.register(newCronTool(cronService, cronExecutor, msgBus))
+    regTagged(newCronTool(cronService, cronExecutor, msgBus), ["scheduling", "automation", "cron"], "schedule recurring tasks with cron expressions")
 
   return al
 

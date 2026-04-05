@@ -16,20 +16,25 @@ method description*(t: UpdateContactTool): string =
   "Updates the name for a contact in your relationship database. Use this when a user introduces themselves or corrects their name. Always use this to remember who someone is if they tell you their name."
 
 method parameters*(t: UpdateContactTool): Table[string, JsonNode] =
-  result = initTable[string, JsonNode]()
-  result["name"] = %*{
-    "type": "string",
-    "description": "The real name of the contact interacting with you (e.g. 'Tom')."
-  }
-  result["identity"] = %*{
-    "type": "string",
-    "enum": ["Guest", "Customer"],
-    "description": "Optional updated identity. ONLY 'Guest' or 'Customer' is allowed. Other identities must be registered by the admin in BASE.json."
-  }
-  result["invitation_code"] = %*{
-    "type": "string",
-    "description": "REQUIRED if you are changing their identity to 'Customer'. Ask the user for their 6-character Pin Code invitation."
-  }
+  {
+    "type": %"object",
+    "properties": %*{
+      "name": {
+        "type": "string",
+        "description": "The real name of the contact interacting with you (e.g. 'Tom')."
+      },
+      "identity": {
+        "type": "string",
+        "enum": ["Guest", "Customer"],
+        "description": "Optional updated identity. ONLY 'Guest' or 'Customer' is allowed. Other identities must be registered by the admin in BASE.json."
+      },
+      "invitation_code": {
+        "type": "string",
+        "description": "REQUIRED if you are changing their identity to 'Customer'. Ask the user for their 6-character Pin Code invitation."
+      }
+    },
+    "required": %["name"]
+  }.toTable
 
 method execute*(t: UpdateContactTool, args: Table[string, JsonNode]): Future[string] {.async.} =
   if not args.hasKey("name") or args["name"].kind == JNull:

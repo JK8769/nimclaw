@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"runtime/debug"
 	"sync"
 
 	"github.com/nknorg/nkn-sdk-go"
@@ -242,22 +243,29 @@ func main() {
 			continue
 		}
 
-		switch req.Method {
-		case "generate_wallet":
-			handleGenerateWallet(req.ID, req.Params)
-		case "generate_wallet_with_seed":
-			handleGenerateWalletWithSeed(req.ID, req.Params)
-		case "create_client":
-			handleCreateClient(req.ID, req.Params)
-		case "get_address":
-			handleGetAddress(req.ID, req.Params)
-		case "send_message":
-			handleSendMessage(req.ID, req.Params)
-		case "close_client":
-			handleCloseClient(req.ID, req.Params)
-		default:
-			sendJSON(Response{ID: req.ID, Error: "unknown method: " + req.Method})
-		}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					sendJSON(Response{ID: req.ID, Error: fmt.Sprintf("panic: %v\n%s", r, debug.Stack())})
+				}
+			}()
+			switch req.Method {
+			case "generate_wallet":
+				handleGenerateWallet(req.ID, req.Params)
+			case "generate_wallet_with_seed":
+				handleGenerateWalletWithSeed(req.ID, req.Params)
+			case "create_client":
+				handleCreateClient(req.ID, req.Params)
+			case "get_address":
+				handleGetAddress(req.ID, req.Params)
+			case "send_message":
+				handleSendMessage(req.ID, req.Params)
+			case "close_client":
+				handleCloseClient(req.ID, req.Params)
+			default:
+				sendJSON(Response{ID: req.ID, Error: "unknown method: " + req.Method})
+			}
+		}()
 	}
 
 	// stdin closed — clean up all clients

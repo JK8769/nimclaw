@@ -1,6 +1,12 @@
 import std/[os, json, strutils, tables, asyncdispatch]
 import agent/cortex, config, providers/http, providers/types, logger, utils
 
+proc modelName(m: JsonNode): string =
+  ## Extract model name from either a string or {"name": "..."} object.
+  if m.kind == JString: m.getStr()
+  elif m.kind == JObject: m{"name"}.getStr("")
+  else: ""
+
 proc updateEnvFile(keyName, keyValue: string) =
   ## Appends or updates a key in the .env file
   let envPath = getNimClawDir() / ".env"
@@ -86,7 +92,8 @@ proc runProviderCommand*(cfg: Config, args: seq[string], api_key = "", api_base 
         if finalModel == "": finalModel = tData{"defaultModel"}.getStr("")
         if tData.hasKey("models"):
           for m in tData["models"]:
-            finalModels.add(m.getStr())
+            let mn = modelName(m)
+            if mn.len > 0: finalModels.add(mn)
         echo "📂 Loaded provider template for $1 with \"defaultModel\": \"$2\"".format(name, finalModel)
       except:
         echo "⚠️ Error loading template: ", getCurrentExceptionMsg()
@@ -203,11 +210,12 @@ proc runProviderCommand*(cfg: Config, args: seq[string], api_key = "", api_base 
       var modelsToTest: seq[string] = @[]
       if checkAll and models.len > 0:
         for m in models:
-          modelsToTest.add(m.getStr())
+          let mn = modelName(m)
+          if mn.len > 0: modelsToTest.add(mn)
       elif defaultModel != "":
         modelsToTest.add(defaultModel)
       elif models.len > 0:
-        modelsToTest.add(models[0].getStr())
+        modelsToTest.add(modelName(models[0]))
       else:
         # Final fallback, though we should prefer configured ones
         modelsToTest.add("gpt-4o-mini")

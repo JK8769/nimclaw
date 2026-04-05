@@ -75,3 +75,21 @@ test_json
 test_feishu_*.js
 package.json
 package-lock.json
+nimble.develop
+nimble.paths
+nimbledeps
+
+# Playwright/MCP local state
+.playwright-*/
+
+# Misc build artifacts
+app_*/
+onboard.sh
+src/nimclaw/tools/loop_detector
+
+# Channel CLI binaries (built, not source)
+channels/bin/
+
+# Python cache
+__pycache__/
+*.pyc

@@ -2,94 +2,34 @@
 
 Ultra-lightweight AI agent framework written in Nim. A high-performance clone of [PicoClaw](https://github.com/picoclaw).
 
-## Features
+## Why NimClaw?
 
-- Multi-channel support: Telegram, Discord, QQ, Feishu, DingTalk, WhatsApp, MaixCam, nMobile
-- Configurable LLM backends via OpenAI-compatible APIs (DeepSeek, Groq, OpenRouter, Anthropic, etc.)
-- Rich toolset: filesystem, shell, web, cron, git, MCP integration, hardware (i2c, spi)
-- Loadable skills via SKILL.md files and OpenClaw plugins
-- World graph (Cortex) with entities, relationships, and RBAC
-- <10MB RAM footprint
-- Zero heavy dependencies for channels
-
-## Requirements
-
-- Nim 2.0+
-- libcurl (for HTTP)
-- OpenSSL (for TLS)
-- Go 1.21+ (for building NKN bridge and lark-cli)
-- Python 3 (for lark-cli metadata fetching)
-
-## Build
-
-### From source (developers)
-
-```bash
-# Clone with submodules
-git clone --recurse-submodules https://github.com/pico-claw/nimclaw
-cd nimclaw
-
-# Install Nim dependencies
-nimble install -y
-
-# Build everything (NimClaw + NKN bridge + lark-cli)
-nimble build_all
-
-# Or build individually
-nimble build_nkn     # NKN/nMobile bridge (Go 1.21+)
-nimble build_lark    # Feishu/Lark CLI (Go 1.23+, Python 3)
-nimble build         # NimClaw only
-```
-
-Cross-compile Go bridges for another platform:
-
-```bash
-./thridparty/build_libnkn.sh linux amd64
-./thridparty/build_lark_cli.sh linux amd64
-```
-
-### Prebuilt binaries (users)
-
-Download the latest release for your platform from [Releases](../../releases). Each release includes `nimclaw`, `nkn_bridge`, and `lark-cli` — no Go or Python required.
+- **Tiny footprint** — under 10MB RAM, single static binary
+- **Multi-channel** — Telegram, Discord, QQ, Feishu/Lark, DingTalk, WhatsApp, MaixCam, nMobile
+- **Any LLM** — OpenAI-compatible APIs: DeepSeek, Groq, OpenRouter, Anthropic, and more
+- **Rich toolset** — filesystem, shell, web, cron, git, MCP integration, hardware (i2c, spi)
+- **Extensible** — loadable skills via SKILL.md files and OpenClaw plugins
+- **World graph** — entity/relationship model with RBAC for multi-agent coordination
+- **Zero heavy deps** — no Node.js, no Python, no Docker required at runtime
 
 ## Quick Start
 
-```bash
-# First-time setup (local dev mode)
-nimble dev onboard
-
-# Start the gateway
-nimble dev gateway
-
-# Send a test message
-nimble dev agent "hello"
-```
-
-### Production
+Download a prebuilt release or [build from source](GUIDE.md#build-from-source), then:
 
 ```bash
 ./nimclaw onboard
 ./nimclaw gateway
 ```
 
-## Configuration
-
-NimClaw stores configuration and state in `~/.nimclaw/`. Override with the `NIMCLAW_DIR` environment variable:
-
-```bash
-export NIMCLAW_DIR=/path/to/config
-./nimclaw onboard
-```
-
-For local development, `nimble dev` uses `.nimclaw/` in the project root.
+See the [Setup Guide](GUIDE.md) for full instructions.
 
 ## Architecture
 
 ```
-Channel → MessageBus (inbound) → Gateway → AgentLoop → LLMProvider → MessageBus (outbound) → Channel
+Channel → MessageBus → Gateway → AgentLoop → LLM Provider → MessageBus → Channel
 ```
 
-See [CLAUDE.md](CLAUDE.md) for detailed architecture documentation.
+Channels listen for messages, the gateway routes them to agent loops, agents call LLM providers with tool access, and responses flow back through the bus to the originating channel.
 
 ## License
 

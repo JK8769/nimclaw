@@ -1,4 +1,4 @@
-import std/[asyncdispatch, json, tables, osproc, streams, strutils, os]
+import std/[asyncdispatch, json, tables, osproc, streams, strutils, os, sets]
 import ../tools/types
 import ../logger
 
@@ -12,6 +12,7 @@ type
     outputThread: Thread[McpClient]
     outputChannel: Channel[string]
     sandboxPrefix*: seq[string] # Optional: ["sandbox-exec", "-p", "..."]
+    namePrefix*: string  # Short alias prefix for tool names (e.g. "pw" for Playwright)
 
   McpError* = object of CatchableError
 
@@ -148,15 +149,22 @@ type
     mcpDescription: string
     mcpParameters: JsonNode
 
-method name*(t: McpTool): string = 
-  let rawName = "mcp_" & t.client.serverName & "_" & t.mcpName
+method name*(t: McpTool): string =
+  let prefix = if t.client.namePrefix.len > 0: t.client.namePrefix
+               else: "mcp_" & t.client.serverName
+  let rawName = prefix & "_" & t.mcpName
   return rawName.replace("-", "_")
 method description*(t: McpTool): string = t.mcpDescription
 method parameters*(t: McpTool): Table[string, JsonNode] =
+  # Return proper JSON Schema object with type/properties wrapper
   result = initTable[string, JsonNode]()
-  if t.mcpParameters.hasKey("properties"):
-    for k, v in t.mcpParameters["properties"].pairs:
-      result[k] = v
+  result["type"] = %"object"
+  if t.mcpParameters.kind == JObject and t.mcpParameters.hasKey("properties"):
+    result["properties"] = t.mcpParameters["properties"]
+    if t.mcpParameters.hasKey("required"):
+      result["required"] = t.mcpParameters["required"]
+  else:
+    result["properties"] = newJObject()
 
 method execute*(t: McpTool, args: Table[string, JsonNode]): Future[string] {.async.} =
   let params = %*{"name": t.mcpName, "arguments": args}
@@ -169,6 +177,68 @@ method execute*(t: McpTool, args: Table[string, JsonNode]): Future[string] {.asy
     return output
   return $res
 
+const
+  ServerTagMap: seq[tuple[pattern: string, tags: seq[string]]] = @[
+    ("playwright", @["browser", "web", "ui"]),
+    ("puppeteer", @["browser", "web", "ui"]),
+    ("selenium", @["browser", "web", "ui"]),
+    ("git", @["git", "devops", "vcs"]),
+    ("github", @["git", "devops", "vcs"]),
+    ("slack", @["messaging", "communication"]),
+    ("discord", @["messaging", "communication"]),
+    ("docker", @["devops", "containers"]),
+    ("kubernetes", @["devops", "containers"]),
+    ("postgres", @["database", "sql"]),
+    ("mysql", @["database", "sql"]),
+    ("sqlite", @["database", "sql"]),
+    ("redis", @["database", "cache"]),
+    ("filesystem", @["filesystem", "data"]),
+    ("aws", @["cloud", "devops"]),
+    ("gcp", @["cloud", "devops"]),
+  ]
+
+  ToolNameTagMap: seq[tuple[keyword: string, tags: seq[string]]] = @[
+    ("browser", @["browser", "web"]),
+    ("navigate", @["browser", "web", "navigation"]),
+    ("click", @["browser", "interaction"]),
+    ("type", @["browser", "interaction", "form"]),
+    ("screenshot", @["browser", "visual"]),
+    ("snapshot", @["browser", "visual"]),
+    ("file", @["filesystem"]),
+    ("read", @["filesystem", "data"]),
+    ("write", @["filesystem", "data"]),
+    ("search", @["search", "data"]),
+    ("fetch", @["web", "http"]),
+    ("api", @["web", "http"]),
+    ("cron", @["scheduling", "automation"]),
+    ("schedule", @["scheduling", "automation"]),
+    ("email", @["messaging", "communication"]),
+    ("send", @["messaging"]),
+    ("deploy", @["devops"]),
+    ("commit", @["git", "devops"]),
+  ]
+
+proc autoTagMcp*(serverName: string, toolName: string): seq[string] =
+  ## Derive tags from MCP server name and tool name using known mappings.
+  var tagSet = initHashSet[string]()
+  let serverLow = serverName.toLowerAscii()
+  let toolLow = toolName.toLowerAscii()
+
+  # Always include server name as a tag
+  tagSet.incl(serverLow)
+
+  # Match server name against known patterns
+  for (pattern, tags) in ServerTagMap:
+    if pattern in serverLow:
+      for t in tags: tagSet.incl(t)
+
+  # Match tool name parts against known keywords
+  for (keyword, tags) in ToolNameTagMap:
+    if keyword in toolLow:
+      for t in tags: tagSet.incl(t)
+
+  for t in tagSet: result.add(t)
+
 proc listTools*(c: McpClient): Future[seq[McpTool]] {.async.} =
   let res = await c.sendRequest("tools/list", %*{})
   result = @[]
@@ -180,6 +250,7 @@ proc listTools*(c: McpClient): Future[seq[McpTool]] {.async.} =
         mcpDescription: tJson["description"].getStr(),
         mcpParameters: tJson["inputSchema"]
       )
+      tool.setTags(autoTagMcp(c.serverName, tJson["name"].getStr()))
       result.add(tool)
 
 proc stop*(c: McpClient) =
