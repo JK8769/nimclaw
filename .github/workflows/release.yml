@@ -10,6 +10,7 @@ permissions:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
@@ -36,10 +37,21 @@ jobs:
       with:
         submodules: recursive
 
-    - name: Setup Nim
+    - name: Setup Nim (choosenim)
+      if: runner.arch != 'ARM64' || runner.os != 'Linux'
       uses: iffy/install-nim@v4
       with:
         version: '2.2.8'
+
+    - name: Setup Nim (ARM64 Linux)
+      if: runner.arch == 'ARM64' && runner.os == 'Linux'
+      run: |
+        curl -L -o nim.tar.xz "https://nim-lang.org/download/nim-2.2.8-linux_arm64.tar.xz"
+        tar xJf nim.tar.xz
+        echo "$PWD/nim-2.2.8/bin" >> $GITHUB_PATH
+        export PATH="$PWD/nim-2.2.8/bin:$PATH"
+        nim --version
+        nimble --version
 
     - name: Setup Go
       uses: actions/setup-go@v5
