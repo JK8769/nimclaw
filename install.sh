@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-REPO="owaf/nimclaw"
+REPO="JK8769/nimclaw"
 INSTALL_DIR="${NIMCLAW_INSTALL_DIR:-$HOME/.local/bin}"
 LIB_DIR="${NIMCLAW_LIB_DIR:-$HOME/.local/lib/nimclaw}"
 VERSION="${NIMCLAW_VERSION:-latest}"
